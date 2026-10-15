@@ -170,11 +170,20 @@ def inspect(spec: JobSpec) -> dict:
         "observed_wall": time.time(),
     }
     if load == "not-found":
-        if record is None:
+        # The unit is definitively gone: with or without an exit record this
+        # job has ended and may be finalized (missing record => inconclusive,
+        # never success). Transient manager failures yield LoadState "unknown"
+        # and must NOT be finalized.
+        observation["ended"] = True
+        if record is None or record.get("corrupt"):
             observation["phase"] = "inconclusive"
-            observation["warning"] = "unit collected without an exit record; result unknown (never success)"
+            observation["warning"] = (
+                "unit collected without a usable exit record; result unknown "
+                "(never success)")
         else:
             observation["phase"] = "terminal"
+    elif load == "unknown":
+        observation["phase"] = "unknown"
     elif states.get("ActiveState") == "active":
         observation["phase"] = "running"
     elif states.get("ActiveState") in ("activating", "reloading"):
@@ -195,29 +204,37 @@ def classify(observation: dict, *, cancel_requested: bool = False) -> dict:
     exit_code = record.get("exit_code")
     exit_status = record.get("exit_status")
     service_result = record.get("service_result")
+    cleanup = observation.get("cgroup", "unknown")
     if observation.get("phase") == "terminal":
         if cancel_requested:
             outcome = "cancelled"
         elif service_result == "timeout":
             outcome = "timed_out"
         elif service_result == "success" and exit_code == "exited" and exit_status == "0":
-            outcome = "passed"
+            # A pass requires BOTH valid exit evidence AND verified-empty
+            # cleanup; unknown cleanup is incomplete evidence, never a pass.
+            outcome = "passed" if cleanup == "verified_empty" else "inconclusive"
         elif service_result in ("exit-code", "signal", "core-dump", "watchdog",
                                 "oom-kill", "resources", "protocol"):
             outcome = "failed"
-        elif record.get("corrupt"):
-            outcome = "inconclusive"
         else:
             outcome = "inconclusive"
+    inconclusive_reason = None
+    if outcome == "inconclusive":
+        inconclusive_reason = (
+            observation.get("warning")
+            or ("corrupt exit record" if record.get("corrupt") else None)
+            or ("cleanup evidence is " + cleanup if cleanup != "verified_empty"
+                and outcome == "inconclusive" else None)
+            or "insufficient terminal evidence")
     return {
         "phase": observation.get("phase"),
         "outcome": outcome,
         "service_result": service_result,
         "exit_code": exit_code,
         "exit_status": exit_status,
-        "cleanup": observation.get("cgroup", "unknown"),
-        "inconclusive_reason": (observation.get("warning")
-                                or ("corrupt exit record" if record.get("corrupt") else None)),
+        "cleanup": cleanup,
+        "inconclusive_reason": inconclusive_reason,
     }
 
 

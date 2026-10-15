@@ -28,6 +28,7 @@ class FakeBackend:
         self.units: dict[str, dict] = {}
         self.launch_calls: list[str] = []
         self.fail_next_launch = False
+        self.manager_down = False
         self.log_entries = [{"cursor": "c1", "message": "line one",
                              "monotonic_ts": "1"}]
 
@@ -50,17 +51,33 @@ class FakeBackend:
 
     def inspect(self, spec):
         state = self.units[linux_jobs.unit_name(spec.job_id)]
+        if self.manager_down:
+            return {"unit": linux_jobs.unit_name(spec.job_id),
+                    "load_state": "unknown", "active_state": None,
+                    "sub_state": None, "result": None, "exec_main_code": None,
+                    "exec_main_status": None, "invocation_id": None,
+                    "exit_record": None, "cgroup": "unknown",
+                    "observed_wall": 2.0, "phase": "unknown",
+                    "ended": False, "warning": None}
+        collected = state["collected"]
+        record = state["record"]
+        if collected and (record is None or record.get("corrupt")):
+            phase = "inconclusive"
+        elif collected:
+            phase = "terminal"
+        else:
+            phase = "running"
         return {"unit": linux_jobs.unit_name(spec.job_id),
-                "load_state": "not-found" if state["collected"] else "loaded",
-                "active_state": None if state["collected"] else "active",
+                "load_state": "not-found" if collected else "loaded",
+                "active_state": None if collected else "active",
                 "sub_state": None, "result": None, "exec_main_code": None,
                 "exec_main_status": None, "invocation_id": None,
-                "exit_record": state["record"],
+                "exit_record": record,
                 "cgroup": state["cgroup"], "observed_wall": 2.0,
-                "phase": "terminal" if state["collected"] else "running",
-                "warning": ("unit collected without an exit record; result unknown "
-                            "(never success)")
-                if state["collected"] and state["record"] is None else None}
+                "phase": phase, "ended": collected,
+                "warning": ("unit collected without a usable exit record; result "
+                            "unknown (never success)")
+                if phase == "inconclusive" else None}
 
     classify = staticmethod(linux_jobs.classify)
 
@@ -232,8 +249,167 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(logs["entries"][0]["message"], "line one")
 
 
+class SessionAndLifecycleTests(unittest.TestCase):
+    """Regression tests for the review fixes: session identity, truthful
+    classification, inconclusive finalization, concurrent duplicates."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "evidence",
+                                        session_id="session-A",
+                                        backend=self.backend)
+
+    def tearDown(self):
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def test_two_controllers_same_session_share_jobs(self):
+        started = self.controller.launch(["/bin/true"], request_id="s1",
+                                         operation_id="op")
+        other = JobController(self.root / "store.sqlite",
+                              evidence_root=self.root / "evidence",
+                              session_id="session-A", backend=self.backend)
+        try:
+            receipt = other.status(started["job_id"])
+            self.assertEqual(receipt["job_id"], started["job_id"])
+            # ...and can wait/cancel/reconcile it after "restart".
+            self.backend.set_terminal(
+                self.controller._spec_for(self.controller.store.get_job(started["job_id"])),
+                {"service_result": "success", "exit_code": "exited",
+                 "exit_status": "0"})
+            result = other.wait(started["job_id"], max_wait_seconds=5)
+            self.assertFalse(result["elapsed"])
+            self.assertEqual(result["receipt"]["outcome"], "passed")
+        finally:
+            other.close()
+
+    def test_success_with_failed_cleanup_is_never_passed(self):
+        job = self.controller.launch(["/bin/true"], request_id="c1",
+                                     operation_id="op")["job_id"]
+        spec = self.controller._spec_for(self.controller.store.get_job(job))
+        self.backend.set_terminal(spec, {"service_result": "success",
+                                         "exit_code": "exited", "exit_status": "0"},
+                                  cgroup="failed")
+        receipt = self.controller.status(job)
+        self.assertEqual(receipt["outcome"], "inconclusive")
+        self.assertIsNotNone(receipt["inconclusive_reason"])
+
+    def test_success_with_unknown_cleanup_is_incomplete_evidence(self):
+        job = self.controller.launch(["/bin/true"], request_id="c2",
+                                     operation_id="op")["job_id"]
+        spec = self.controller._spec_for(self.controller.store.get_job(job))
+        self.backend.set_terminal(spec, {"service_result": "success",
+                                         "exit_code": "exited", "exit_status": "0"},
+                                  cgroup="unknown")
+        receipt = self.controller.status(job)
+        self.assertEqual(receipt["outcome"], "inconclusive")
+
+    def test_collected_missing_record_finalizes_inconclusive(self):
+        job = self.controller.launch(["/bin/true"], request_id="g1",
+                                     operation_id="op")["job_id"]
+        spec = self.controller._spec_for(self.controller.store.get_job(job))
+        self.backend.units[linux_jobs.unit_name(spec.job_id)]["collected"] = True
+        receipt = self.controller.status(job)
+        self.assertEqual(receipt["outcome"], "inconclusive")
+        row = self.controller.store.get_job(job)
+        self.assertEqual(row["state"], "completed")
+        self.assertIsNotNone(row["terminal_wall"])
+        # Idempotent: repeated status/reconcile stays terminal, never relaunches.
+        again = self.controller.status(job)
+        self.assertEqual(again["outcome"], "inconclusive")
+        self.assertEqual(len(self.backend.launch_calls), 1)
+
+    def test_collected_corrupt_record_finalizes_inconclusive(self):
+        job = self.controller.launch(["/bin/true"], request_id="g2",
+                                     operation_id="op")["job_id"]
+        spec = self.controller._spec_for(self.controller.store.get_job(job))
+        self.backend.set_terminal(spec, {"corrupt": True})
+        self.backend.units[linux_jobs.unit_name(spec.job_id)]["collected"] = True
+        receipt = self.controller.status(job)
+        self.assertEqual(receipt["outcome"], "inconclusive")
+        self.assertIn("corrupt", receipt["inconclusive_reason"])
+
+    def test_temporary_manager_failure_never_finalizes(self):
+        job = self.controller.launch(["/bin/true"], request_id="m1",
+                                     operation_id="op")["job_id"]
+        self.backend.manager_down = True
+        result = self.controller.status(job)
+        self.assertEqual(result["phase"], "unknown")
+        row = self.controller.store.get_job(job)
+        self.assertNotEqual(row["state"], "completed")
+        # Recovery: manager back, job completes normally.
+        self.backend.manager_down = False
+        spec = self.controller._spec_for(self.controller.store.get_job(job))
+        self.backend.set_terminal(spec, {"service_result": "success",
+                                         "exit_code": "exited", "exit_status": "0"})
+        receipt = self.controller.status(job)
+        self.assertEqual(receipt["outcome"], "passed")
+
+class UnlaunchedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "evidence",
+                                        session_id="session-A",
+                                        backend=self.backend)
+
+    def tearDown(self):
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def test_reconcile_unlaunched_row_finalizes_blocked(self):
+        from agent_exec.store import Store
+        store = Store(self.root / "store.sqlite")
+        job_id = store.create_job(session_id="session-A", request_id="ghost",
+                                  operation_id="op", profile_id=None,
+                                  purpose="verify", unit="(unlaunched)",
+                                  job_dir=self.root / "ghost",
+                                  deadline_seconds=10, stop_grace_seconds=2)
+        store.close()
+        result = self.controller.reconcile(job_id)
+        self.assertTrue(result["reconciled"])
+        receipt = result["receipt"]
+        self.assertEqual(receipt["outcome"], "blocked")
+        self.assertIsNotNone(receipt["inconclusive_reason"])
+
+    def test_concurrent_duplicate_requests_produce_one_job(self):
+        import threading
+        results = []
+        barrier = threading.Barrier(4)
+
+        def launch():
+            barrier.wait()
+            results.append(self.controller.launch(["/bin/true"], request_id="race",
+                                                  operation_id="op"))
+
+        threads = [threading.Thread(target=launch) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        ids = {r["job_id"] for r in results}
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(len(self.backend.launch_calls), 1)
+        self.assertEqual(sum(1 for r in results if not r["replayed"]), 1)
+
+    def test_launch_env_never_persisted_to_journal(self):
+        self.controller.launch(["/bin/true"], request_id="env",
+                               operation_id="op",
+                               env={"SECRET_TOKEN": "super-secret-value"})
+        row = self.controller.store.get_job(
+            self.controller.store.find_by_request("session-A", "env")["job_id"])
+        self.assertNotIn("super-secret-value", row["launch_argv_json"] or "")
+
+
 class RealNativeTest(unittest.TestCase):
-    """Actual systemd proof; opt-in via XTX_EXEC_REAL=1 (bounded, ~10 s)."""
+    """Actual systemd proof; opt-in via XTX_EXEC_REAL=1 (bounded, ~30 s)."""
 
     def setUp(self):
         if __import__("os").environ.get("XTX_EXEC_REAL") != "1":
@@ -243,7 +419,8 @@ class RealNativeTest(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            controller = JobController(root / "s.sqlite", evidence_root=root / "ev")
+            controller = JobController(root / "s.sqlite", evidence_root=root / "ev",
+                                       session_id="native-session")
             try:
                 ok = controller.launch(["/usr/bin/true"], request_id="native-ok",
                                        operation_id="native")
@@ -258,6 +435,63 @@ class RealNativeTest(unittest.TestCase):
                     or controller.status(slow["job_id"])
                 self.assertEqual(receipt["outcome"], "timed_out")
                 self.assertEqual(receipt["cleanup"], "verified_empty")
+            finally:
+                controller.close()
+
+    def test_cross_invocation_native_flow(self):
+        """Launch in one controller; wait+status from a fresh one, same session."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = JobController(root / "s.sqlite", evidence_root=root / "ev",
+                                  session_id="native-shared")
+            try:
+                started = first.launch(["/usr/bin/true"], request_id="xinv",
+                                       operation_id="native")
+            finally:
+                first.close()
+            second = JobController(root / "s.sqlite", evidence_root=root / "ev",
+                                   session_id="native-shared")
+            try:
+                receipt = second.wait(started["job_id"], max_wait_seconds=15).get("receipt") \
+                    or second.status(started["job_id"])
+                self.assertEqual(receipt["outcome"], "passed")
+                self.assertEqual(receipt["cleanup"], "verified_empty")
+            finally:
+                second.close()
+
+    def test_missing_exit_record_finalizes_inconclusive_on_real_units(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            controller = JobController(root / "s.sqlite", evidence_root=root / "ev",
+                                       session_id="native-session")
+            try:
+                ok = controller.launch(["/usr/bin/true"], request_id="native-ok2",
+                                       operation_id="native")
+                job_dir = Path(controller.store.get_job(ok["job_id"])["job_dir"])
+                record = job_dir / "exit-record.json"
+                # Poll the FILESYSTEM for completion; any controller status()
+                # call would absorb the receipt before we can remove evidence.
+                import time as _time
+                deadline = _time.monotonic() + 15
+                while _time.monotonic() < deadline:
+                    if record.is_file():
+                        break
+                    _time.sleep(0.2)
+                self.assertTrue(record.is_file())
+                record.unlink()
+                revived = JobController(root / "s.sqlite", evidence_root=root / "ev",
+                                        session_id="native-session")
+                try:
+                    receipt = revived.status(ok["job_id"])
+                    self.assertEqual(receipt["outcome"], "inconclusive")
+                    self.assertIsNotNone(receipt["inconclusive_reason"])
+                    # Idempotent: a second reconcile stays terminal.
+                    again = revived.reconcile(ok["job_id"])
+                    self.assertEqual(again["receipt"]["outcome"], "inconclusive")
+                finally:
+                    revived.close()
             finally:
                 controller.close()
 

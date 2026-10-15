@@ -69,11 +69,18 @@ class JobController:
             env=env or {}, purpose=purpose, operation_id=operation_id, cwd=cwd)
         # Reserve the row first so duplicate concurrent requests hit the unique
         # index; the real job id replaces the placeholder afterwards.
-        job_id = self.store.create_job(
-            session_id=self.session_id, request_id=request_id,
-            operation_id=operation_id, profile_id=profile_id, purpose=purpose,
-            unit="(unlaunched)", job_dir=job_dir, deadline_seconds=deadline_seconds,
-            stop_grace_seconds=stop_grace_seconds)
+        try:
+            job_id = self.store.create_job(
+                session_id=self.session_id, request_id=request_id,
+                operation_id=operation_id, profile_id=profile_id, purpose=purpose,
+                unit="(unlaunched)", job_dir=job_dir, deadline_seconds=deadline_seconds,
+                stop_grace_seconds=stop_grace_seconds)
+        except DuplicateRequest:
+            # A concurrent identical request reserved the row first; its
+            # launch is authoritative. Replay the same job id.
+            existing = self.store.find_by_request(self.session_id, request_id)
+            return {"job_id": existing["job_id"], "replayed": True,
+                    "state": existing["state"]}
         spec.job_id = job_id
         try:
             meta = self.backend.launch(spec)
@@ -84,10 +91,13 @@ class JobController:
             self.store.record_event(job_id, "terminal",
                                     {"outcome": "blocked", "error": str(error)[:300]})
             raise JobError(f"launch failed: {error}") from error
+        # Persist the launch argv WITHOUT environment values: the journal is
+        # not a secret store, and reconcile does not need them.
+        redacted = [a for a in meta["launch_argv"] if not a.startswith("--setenv=")]
         self.store.update_job(job_id, unit=meta["unit"], boot_id=meta["boot_id"],
                               invocation_id=meta["invocation_id"], state="running",
                               started_wall=meta["launch_wall"],
-                              launch_argv_json=json.dumps(meta["launch_argv"]))
+                              launch_argv_json=json.dumps(redacted))
         self.store.record_event(job_id, "launched",
                                 {"unit": meta["unit"], "invocation_id": meta["invocation_id"]})
         return {"job_id": job_id, "replayed": False, "state": "running"}
@@ -126,12 +136,34 @@ class JobController:
             return self._receipt(row)
         spec = self._spec_for(row)
         observation = self.backend.inspect(spec)
+        if observation.get("load_state") == "unknown":
+            # Transient manager communication failure: report, never finalize.
+            self.store.record_event(job_id, "status", {"phase": "unknown"})
+            return {"job_id": job_id, "state": row["state"], "phase": "unknown",
+                    "unit": row["unit"]}
         if observation["phase"] == "terminal":
             return self._absorb_terminal(job_id, row, spec, observation)
+        if observation.get("phase") == "inconclusive" and observation.get("ended"):
+            # The unit is definitively collected but its exit evidence is
+            # missing/corrupt: the job HAS ended. Finalize as inconclusive
+            # (never success) and persist the reason.
+            return self._finalize_inconclusive(job_id, observation)
         self.store.record_event(job_id, "status",
                                 {"phase": observation["phase"]})
         return {"job_id": job_id, "state": row["state"],
                 "phase": observation["phase"], "unit": row["unit"]}
+
+    def _finalize_inconclusive(self, job_id: str, observation: dict) -> dict:
+        import json as _json
+        record = _json.dumps(observation.get("exit_record"))
+        self.store.update_job(job_id, state="completed", outcome="inconclusive",
+                              exit_record_json=record,
+                              cleanup=observation.get("cgroup", "unknown"),
+                              terminal_wall=time.time())
+        self.store.record_event(job_id, "reconciled", {
+            "outcome": "inconclusive", "cleanup": observation.get("cgroup"),
+            "reason": observation.get("warning") or "missing usable exit evidence"})
+        return self._receipt(self.store.get_job(job_id))
 
     def _absorb_terminal(self, job_id: str, row: dict, spec, observation) -> dict:
         verdict = self.backend.classify(
@@ -174,6 +206,7 @@ class JobController:
             "exit_code": (record or {}).get("exit_code"),
             "exit_status": (record or {}).get("exit_status"),
             "cleanup": row["cleanup"],
+            "inconclusive_reason": verdict_reason(row),
             "cancel_requested": bool(row["cancel_requested"]),
             "started_wall": row["started_wall"],
             "terminal_wall": row["terminal_wall"],
@@ -254,14 +287,31 @@ class JobController:
         if row["state"] in TERMINAL_STATES:
             return {"reconciled": False, "reason": "already terminal",
                     "receipt": self._receipt(row)}
+        if row["unit"] == "(unlaunched)":
+            # Reserved but launch never confirmed (controller crash between
+            # reservation and systemd-run). No unit can exist for this row;
+            # finalize blocked rather than leave it open forever.
+            self.store.update_job(job_id, state="completed", outcome="blocked",
+                                  terminal_wall=time.time())
+            self.store.record_event(job_id, "reconciled",
+                                    {"outcome": "blocked",
+                                     "reason": "launch never confirmed (unit unlaunched)"})
+            return {"reconciled": True, "receipt": self._receipt(self.store.get_job(job_id))}
         spec = self._spec_for(row)
         outcome = self.backend.reconcile(spec,
                                          cancel_requested=bool(row["cancel_requested"]))
         observation = outcome["observation"]
+        if observation.get("load_state") == "unknown":
+            self.store.record_event(job_id, "status",
+                                    {"phase": "unknown", "reconciled": True})
+            return {"reconciled": False, "reason": "manager communication failed; retry later"}
         if observation["phase"] == "terminal":
             return {"reconciled": True, "receipt":
                     self._absorb_terminal(job_id, row, spec, observation)}
-        if row["cancel_requested"] and observation["phase"] in ("unknown", "inconclusive"):
+        if observation.get("phase") == "inconclusive" and observation.get("ended"):
+            return {"reconciled": True, "receipt":
+                    self._finalize_inconclusive(job_id, observation)}
+        if row["cancel_requested"] and observation.get("phase") == "inconclusive":
             self.store.update_job(job_id, state="completed", outcome="inconclusive",
                                   cleanup=observation.get("cgroup", "unknown"),
                                   terminal_wall=time.time())
@@ -282,6 +332,19 @@ class JobController:
             except JobError as error:
                 results.append({"job_id": row["job_id"], "error": str(error)})
         return results
+
+
+def verdict_reason(row: dict) -> str | None:
+    """Best-effort persistent reason for inconclusive/blocked outcomes."""
+    if row.get("outcome") not in ("inconclusive", "blocked"):
+        return None
+    import json as _json
+    record = _json.loads(row["exit_record_json"]) if row["exit_record_json"] else None
+    if record and record.get("corrupt"):
+        return "corrupt exit record"
+    if row.get("outcome") == "blocked":
+        return "launch never confirmed"
+    return "missing usable exit evidence"
 
 
 def _event_public(row: dict) -> dict:

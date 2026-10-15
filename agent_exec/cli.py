@@ -6,18 +6,47 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+import uuid
 from pathlib import Path
+
+import uuid
 
 from . import linux_jobs
 from .jobs import JobController, JobError
 
 DEFAULT_ROOT = Path("/var/lib/xtx-benchmarks/execution-layer-20261013")
+SESSION_FILE = Path.home() / ".agent-exec" / "session-id"
+
+
+def default_session_id() -> str:
+    """Persistent local-CLI identity so separate invocations share jobs.
+
+    Resolution: --session-id flag > AGENT_EXEC_SESSION_ID env >
+    ~/.agent-exec/session-id file (created on first use). Embedded callers
+    (supervisor, tests) pass explicit ids and keep full isolation.
+    """
+    env = os.environ.get("AGENT_EXEC_SESSION_ID")
+    if env:
+        return env
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if SESSION_FILE.is_file():
+            value = SESSION_FILE.read_text().strip()
+            if value:
+                return value
+        value = "cli-" + uuid.uuid4().hex[:12]
+        SESSION_FILE.write_text(value + chr(10))
+        return value
+    except OSError:
+        return "cli-" + uuid.uuid4().hex[:12]
 
 
 def _controller(args) -> JobController:
-    return JobController(Path(args.store), evidence_root=Path(args.evidence_root))
+    return JobController(Path(args.store), evidence_root=Path(args.evidence_root),
+                         session_id=args.session_id)
 
 
 def cmd_selftest(args) -> int:
@@ -115,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent_exec.cli")
     parser.add_argument("--store", default=str(DEFAULT_ROOT / "controller.sqlite"))
     parser.add_argument("--evidence-root", default=str(DEFAULT_ROOT))
+    parser.add_argument("--session-id", default=None,
+                        help="session identity (default: persistent "
+                             "~/.agent-exec/session-id; AGENT_EXEC_SESSION_ID "
+                             "env overrides)")
     sub = parser.add_subparsers(dest="command", required=True)
     launch = sub.add_parser("launch")
     launch.add_argument("--request-id", required=True)
@@ -135,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     selftest.add_argument("--backend", choices=["linux"], default="linux")
     selftest.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if getattr(args, "session_id", None) is None:
+        args.session_id = default_session_id()
     try:
         if args.command == "selftest":
             return cmd_selftest(args)
