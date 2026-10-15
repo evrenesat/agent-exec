@@ -106,3 +106,54 @@ test("launch failure surfaces the supervisor error", async () => {
   await assert.rejects(() => core.launchOperation("nope", { requestId: "r" }),
     /unknown operation/);
 });
+
+// P0#3 regression: an unfiltered wait must never settle on another job's
+// terminal event. Job A completes while we wait for Job B; B must keep
+// waiting, then fail, and the result must identify B.
+test("concurrent jobs: waiting for B ignores A's completion and returns B's failure", async () => {
+  const stream = [
+    { events: [{ job_id: "A", revision: 1, status: "passed", outcome: "passed",
+                 terminal: true }], cursor: 1 },
+    { events: [], cursor: 1 },
+    { events: [], cursor: 1 },
+    { events: [{ job_id: "B", revision: 1, status: "failed", outcome: "failed",
+                 terminal: true }], cursor: 2 },
+  ];
+  let call = 0;
+  const fetchImpl = async () => {
+    const payload = stream[Math.min(call, stream.length - 1)];
+    call += 1;
+    return jsonResponse(200, payload);
+  };
+  const core = new BridgeCore({ supervisorUrl: "http://x", fetchImpl,
+    options: { pollIntervalMs: 5 } });
+  const result = await core.pollUntilTerminal({ jobId: "B", maxWaitMs: 5000 });
+  assert.equal(result.inconclusive, false);
+  assert.equal(result.settled_event.job_id, "B");
+  assert.equal(result.settled_event.outcome, "failed");
+  assert.ok(result.events.some((e) => e.job_id === "A"),
+            "A's event stays available in the collected stream");
+  assert.equal(result.settled_event.job_id !== "A", true);
+});
+
+test("expiry on job-specific wait is explicitly inconclusive", async () => {
+  const fetchImpl = async () => jsonResponse(200, { events: [
+    { job_id: "A", revision: 1, status: "passed", outcome: "passed",
+      terminal: true }], cursor: 1 });
+  const core = new BridgeCore({ supervisorUrl: "http://x", fetchImpl,
+    options: { pollIntervalMs: 5 } });
+  const result = await core.pollUntilTerminal({ jobId: "B", maxWaitMs: 120 });
+  assert.equal(result.inconclusive, true);
+  assert.equal(result.settled_event, null);
+  assert.equal(result.job_id, "B");
+});
+
+test("terminal event present before waiting settles immediately for that job", async () => {
+  const fetchImpl = async () => jsonResponse(200, { events: [
+    { job_id: "B", revision: 1, status: "completed", outcome: "passed",
+      terminal: true }], cursor: 3 });
+  const core = new BridgeCore({ supervisorUrl: "http://x", fetchImpl });
+  const result = await core.pollUntilTerminal({ jobId: "B", maxWaitMs: 500 });
+  assert.equal(result.inconclusive, false);
+  assert.equal(result.settled_event.job_id, "B");
+});

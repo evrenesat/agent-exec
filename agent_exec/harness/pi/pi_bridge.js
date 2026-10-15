@@ -101,12 +101,16 @@ export default function execBridge(pi) {
       const bridge = getCore();
       const launch = await bridge.launchOperation(params.operation,
         { requestId: params.request_id });
+      // Wait for THIS job's terminal event only — the supervisor stream is
+      // shared across jobs, and an unfiltered wait could settle on some other
+      // job's completion. Receipt is fetched by the id launch returned.
       const receipt = await bridge.pollUntilTerminal({
+        jobId: launch.job_id,
         maxWaitMs: clampMs(params.timeout_ms, 120000, 300000), signal });
       let job = null;
-      if (receipt.terminal?.job_id) {
+      if (receipt.terminal) {
         try {
-          job = await bridge.fetchJob(receipt.terminal.job_id);
+          job = await bridge.fetchJob(launch.job_id);
         } catch (error) {
           bridge.log({ phase: "job_fetch_error",
             error: String(error).slice(0, 120) });

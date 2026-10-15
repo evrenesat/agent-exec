@@ -52,13 +52,15 @@ export default async function ExecBridge() {
     execute: async (args) => {
       const launch = await core.launchOperation(args.operation,
         { requestId: args.request_id });
+      // Wait for THIS job's terminal event only: the supervisor stream is
+      // shared across jobs, so an unfiltered wait could settle on some other
+      // job's completion. Receipt fetched by the id launch returned.
       const receipt = await core.pollUntilTerminal(
-        { maxWaitMs: args.timeout_ms ?? 120000 });
+        { jobId: launch.job_id, maxWaitMs: args.timeout_ms ?? 120000 });
       let job = null;
-      const terminal = receipt.events.find((e) => e.terminal && e.job_id);
-      if (terminal) {
+      if (receipt.settled_event) {
         try {
-          job = await core.fetchJob(terminal.job_id);
+          job = await core.fetchJob(launch.job_id);
         } catch (error) {
           log({ phase: "job_fetch_error", error: String(error).slice(0, 120) });
         }

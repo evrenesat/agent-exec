@@ -43,9 +43,15 @@ export class BridgeCore {
     return fresh;
   }
 
-  async pollUntilTerminal({ maxWaitMs, pollIntervalMs } = {}) {
+  // Wait for THIS job's terminal event only. The supervisor stream carries
+  // every job's events, so an unfiltered wait can attribute another job's
+  // completion to ours. With jobId, only that job's terminal event settles
+  // the wait; expiry yields an explicit inconclusive, never another job's
+  // receipt. Without jobId (generic event drain) no terminal matching occurs.
+  async pollUntilTerminal({ jobId = null, maxWaitMs, pollIntervalMs } = {}) {
     const deadline = Date.now() + (maxWaitMs ?? this.options.maxWaitMs);
     const collected = [];
+    let settled = null;
     while (Date.now() < deadline) {
       let fresh = [];
       try {
@@ -54,14 +60,23 @@ export class BridgeCore {
         this.pollErrors += 1;
         this.log({ phase: "poll_error", error: String(error).slice(0, 120) });
       }
-      for (const ev of fresh) collected.push(ev);
-      if (collected.some((e) => e.terminal)) break;
+      for (const ev of fresh) {
+        collected.push(ev);
+        if (ev.terminal && (jobId === null || ev.job_id === jobId) && !settled) {
+          settled = ev;
+        }
+      }
+      if (settled) break;
       await sleep(pollIntervalMs ?? this.options.pollIntervalMs);
     }
     return {
+      job_id: jobId,
       events: collected.map((e) => ({ job_id: e.job_id, revision: e.revision,
         status: e.status, terminal: e.terminal === true, outcome: e.outcome,
         cleanup: e.cleanup })),
+      settled_event: settled ? { job_id: settled.job_id, revision: settled.revision,
+        status: settled.status, outcome: settled.outcome, cleanup: settled.cleanup } : null,
+      inconclusive: !settled,
       poll_errors: this.pollErrors,
       remaining_ms: Math.max(0, deadline - Date.now()),
     };

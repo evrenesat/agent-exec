@@ -60,7 +60,11 @@ export class BridgeCore {
     return fresh;
   }
 
-  async pollUntilTerminal({ maxWaitMs, pollIntervalMs, signal } = {}) {
+  // Wait for THIS job's terminal event only (jobId required for job-specific
+  // waits — the supervisor stream carries every job's events, and an
+  // unfiltered wait can attribute another job's completion to ours).
+  // jobId === null keeps generic event-drain semantics (no terminal matching).
+  async pollUntilTerminal({ jobId = null, maxWaitMs, pollIntervalMs, signal } = {}) {
     const deadline = Date.now() + (maxWaitMs ?? this.options.maxWaitMs);
     const collected = [];
     let aborted = false;
@@ -77,21 +81,26 @@ export class BridgeCore {
       }
       for (const ev of fresh) {
         collected.push(ev);
-        if (ev.terminal && !terminal) terminal = ev;
+        if (ev.terminal && (jobId === null || ev.job_id === jobId) && !terminal) {
+          terminal = ev;
+        }
       }
       if (terminal) break;
       await sleep(pollIntervalMs ?? this.options.pollIntervalMs);
     }
     return {
+      job_id: jobId,
       events: collected.map((e) => ({ job_id: e.job_id, revision: e.revision,
         status: e.status, terminal: e.terminal === true, outcome: e.outcome,
         cleanup: e.cleanup })),
       poll_errors: this.pollErrors,
       remaining_ms: Math.max(0, deadline - Date.now()),
-      terminal,
+      terminal: terminal ? { job_id: terminal.job_id, revision: terminal.revision,
+        status: terminal.status, outcome: terminal.outcome,
+        cleanup: terminal.cleanup } : null,
       aborted,
-      // Truthful: elapsed wait without terminal evidence is inconclusive,
-      // never a success and never a failure of the underlying job.
+      // Truthful: elapsed wait without THIS job's terminal evidence is
+      // inconclusive — never another job's receipt, never a fabricated result.
       inconclusive: !terminal,
     };
   }
