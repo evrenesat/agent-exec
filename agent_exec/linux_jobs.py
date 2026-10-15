@@ -269,6 +269,7 @@ def read_logs(spec: JobSpec, *, after_cursor: str | None = None,
     entries = []
     used = 0
     truncated = False
+    oversized = 0
     next_cursor = after_cursor
     for line in out.stdout.splitlines():
         if not line.startswith("{"):
@@ -278,17 +279,33 @@ def read_logs(spec: JobSpec, *, after_cursor: str | None = None,
         except json.JSONDecodeError:
             continue
         cursor = entry.get("__CURSOR")
-        if cursor:
-            next_cursor = cursor
         size = len(line) + 1
+        if size > max_bytes:
+            # Single entry larger than the whole budget: no budget could ever
+            # hold it. Report it explicitly and advance past it (documented
+            # policy; the entry is flagged, not silently dropped).
+            oversized += 1
+            if cursor:
+                next_cursor = cursor
+            entries.append({"cursor": cursor,
+                            "message": "<oversized entry omitted>",
+                            "monotonic_ts": entry.get("__MONOTONIC_TIMESTAMP")})
+            continue
         if used + size > max_bytes:
+            # Budget exhausted: stop WITHOUT advancing past the skipped
+            # entry, so a later read with a larger budget re-reads it.
             truncated = True
             break
         used += size
+        if cursor:
+            next_cursor = cursor
         entries.append({"cursor": cursor, "message": entry.get("MESSAGE", ""),
                         "monotonic_ts": entry.get("__MONOTONIC_TIMESTAMP")})
     return {"entries": entries, "next_cursor": next_cursor, "bytes": used,
-            "truncated": truncated, "gap": None}
+            "truncated": truncated, "oversized_entries": oversized,
+            "gap": None,
+            "note": "cursor advances only past accepted entries; re-read "
+                    "with a larger max_bytes to retrieve skipped ones"}
 
 
 def reconcile(spec: JobSpec, *, cancel_requested: bool = False) -> dict:

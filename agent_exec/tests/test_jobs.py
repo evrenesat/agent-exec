@@ -7,6 +7,7 @@ without touching systemd.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import unittest
@@ -498,3 +499,63 @@ class RealNativeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogPaginationTests(unittest.TestCase):
+    """P1#8: bounded reads must not silently skip entries (cursor advances
+    only past accepted entries). Uses the real read_logs against a fake
+    journalctl -- replace _run to feed a canned stream."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.spec = linux_jobs.JobSpec(job_id="logp", argv=["/bin/true"],
+                                       job_dir=Path(self.tmp.name))
+        self.original_run = linux_jobs._run
+
+    def tearDown(self):
+        linux_jobs._run = self.original_run
+        self.tmp.cleanup()
+
+    def fake_journal(self, lines: str):
+        class Out:
+            returncode = 0
+            stdout = lines
+            stderr = ""
+        linux_jobs._run = lambda argv, timeout=30: Out()
+
+    def test_budget_exhaustion_stops_before_the_excluded_entry(self):
+        e1 = json.dumps({"__CURSOR": "c1", "MESSAGE": "one",
+                         "__MONOTONIC_TIMESTAMP": "1"})
+        e2 = json.dumps({"__CURSOR": "c2", "MESSAGE": "two" * 40,
+                         "__MONOTONIC_TIMESTAMP": "2"})
+        e3 = json.dumps({"__CURSOR": "c3", "MESSAGE": "three",
+                         "__MONOTONIC_TIMESTAMP": "3"})
+        self.fake_journal(e1 + "\n" + e2 + "\n" + e3 + "\n")
+        result = linux_jobs.read_logs(self.spec, max_bytes=250)
+        cursors = [e["cursor"] for e in result["entries"]]
+        self.assertEqual(cursors, ["c1"],
+                         "entry 2 excluded by budget => cursor stays at c1")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["oversized_entries"], 0)
+        # Sequential re-read with a bigger budget reconstructs in order.
+        full = linux_jobs.read_logs(self.spec, max_bytes=100_000)
+        self.assertEqual([e["cursor"] for e in full["entries"]], ["c1", "c2", "c3"])
+
+    def test_oversized_entry_is_flagged_and_advanced(self):
+        e1 = json.dumps({"__CURSOR": "c1", "MESSAGE": "one",
+                         "__MONOTONIC_TIMESTAMP": "1"})
+        e2 = json.dumps({"__CURSOR": "c2", "MESSAGE": "two" * 400,
+                         "__MONOTONIC_TIMESTAMP": "2"})
+        e3 = json.dumps({"__CURSOR": "c3", "MESSAGE": "three",
+                         "__MONOTONIC_TIMESTAMP": "3"})
+        self.fake_journal(e1 + "\n" + e2 + "\n" + e3 + "\n")
+        result = linux_jobs.read_logs(self.spec, max_bytes=200)
+        self.assertEqual(result["oversized_entries"], 1)
+        self.assertFalse(result["truncated"])
+        # c3 is reached only after c2 was explicitly accounted (marker entry).
+        self.assertEqual([e["cursor"] for e in result["entries"]],
+                         ["c1", "c2", "c3"])
+        self.assertTrue(any("oversized" in e["message"] for e in result["entries"]))
+
+
