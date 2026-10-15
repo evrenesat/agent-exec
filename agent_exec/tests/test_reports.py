@@ -81,7 +81,15 @@ class VitestJsonTests(unittest.TestCase):
 
     def test_zero_tests_with_suites_flagged_as_incomplete_required_check(self):
         result = read_vitest_json(self.write(json.dumps(valid_report(0, 0)).encode()))
-        self.assertTrue(any("not success" in note for note in result["notes"]))
+        self.assertFalse(result["complete"])
+        self.assertTrue(any("never success" in note for note in result["notes"]))
+
+    def test_zero_test_junit_is_not_complete(self):
+        payload = (b"<testsuites><testsuite name='s' tests='0' failures='0'"
+                   b" errors='0' skipped='0'></testsuite></testsuites>")
+        result = read_junit_xml(self.write(payload))
+        self.assertFalse(result["complete"])
+        self.assertTrue(any("never success" in n for n in result["notes"]))
 
 
 class JunitTests(unittest.TestCase):

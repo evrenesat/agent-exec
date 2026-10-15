@@ -38,10 +38,11 @@ class LedgerTests(unittest.TestCase):
     def test_complete_requires_every_check_passed(self):
         led = ledger()
         led.observe(requirement_id="unit", job_id="j1", outcome="passed",
-                    receipt={"outcome": "passed"})
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"})
         manifest = led.manifest()
         self.assertFalse(manifest["complete"])  # lint + visual still missing
-        led.observe(requirement_id="lint", job_id="j2", outcome="passed")
+        led.observe(requirement_id="lint", job_id="j2", outcome="passed",
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"})
         led.observe(requirement_id="visual", job_id=None, outcome="passed")
         self.assertTrue(led.manifest()["complete"])
 
@@ -58,6 +59,7 @@ class LedgerTests(unittest.TestCase):
     def test_fingerprint_change_stales_passed_checks(self):
         led = ledger()
         led.observe(requirement_id="unit", job_id="j1", outcome="passed",
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"},
                     input_fingerprint="abc")
         self.assertEqual(led.invalidate_stale("xyz"), ["unit"])
         self.assertEqual(led.manifest()["checks"]["unit"]["state"], "stale")
@@ -66,14 +68,17 @@ class LedgerTests(unittest.TestCase):
     def test_unknown_fingerprint_invalidates_nothing(self):
         led = ledger()
         led.observe(requirement_id="unit", job_id="j1", outcome="passed",
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"},
                     input_fingerprint="abc")
         self.assertEqual(led.invalidate_stale(None), [])
         self.assertEqual(led.manifest()["checks"]["unit"]["state"], "passed")
 
     def test_manual_acceptance_is_declared_not_inferred(self):
         led = ledger()
-        led.observe(requirement_id="unit", job_id="j1", outcome="passed")
-        led.observe(requirement_id="lint", job_id="j2", outcome="passed")
+        led.observe(requirement_id="unit", job_id="j1", outcome="passed",
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"})
+        led.observe(requirement_id="lint", job_id="j2", outcome="passed",
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"})
         led.observe(requirement_id="visual", job_id=None, outcome="passed")
         manifest = led.manifest()
         self.assertTrue(manifest["checks"]["visual"]["manual"])
@@ -84,10 +89,42 @@ class LedgerTests(unittest.TestCase):
         led = ledger()
         led.observe(requirement_id="unit", job_id="j1", outcome="failed")
         led.observe(requirement_id="unit", job_id="j2", outcome="passed",
+                    receipt={"outcome": "passed", "cleanup": "verified_empty"},
                     input_fingerprint="f1")
         entry = led.entries["unit"]
         self.assertEqual(entry.state, "passed")
         self.assertEqual(entry.job_id, "j2")
+
+
+class ReceiptDerivedPassTests(unittest.TestCase):
+    """P1#7: an automated check cannot pass on a bare status string."""
+
+    def setUp(self):
+        self.led = ledger()
+
+    def test_pass_without_job_id_rejected(self):
+        with self.assertRaises(ValueError):
+            self.led.observe(requirement_id="unit", job_id=None, outcome="passed")
+
+    def test_pass_without_validating_receipt_rejected(self):
+        with self.assertRaises(ValueError):
+            self.led.observe(requirement_id="unit", job_id="j9", outcome="passed",
+                             receipt={"outcome": "failed",
+                                      "cleanup": "verified_empty"})
+        with self.assertRaises(ValueError):
+            self.led.observe(requirement_id="unit", job_id="j9", outcome="passed",
+                             receipt={"outcome": "passed", "cleanup": "unknown"})
+
+    def test_pass_with_full_receipt_accepted(self):
+        entry = self.led.observe(requirement_id="unit", job_id="j9",
+                                 outcome="passed",
+                                 receipt={"outcome": "passed",
+                                          "cleanup": "verified_empty"})
+        self.assertEqual(entry.state, "passed")
+
+    def test_manual_requirement_still_accepts_declared_pass(self):
+        self.led.observe(requirement_id="visual", job_id=None, outcome="passed")
+        self.assertEqual(self.led.manifest()["checks"]["visual"]["state"], "passed")
 
 
 if __name__ == "__main__":

@@ -52,6 +52,20 @@ class VerificationLedger:
             raise KeyError(f"unknown requirement: {requirement_id!r}")
         if outcome not in STATES:
             raise ValueError(f"unknown outcome state: {outcome!r}")
+        requirement = self.requirements[requirement_id]
+        if outcome == "passed" and not requirement.manual:
+            # An automated check passes only on the strength of a trusted job
+            # receipt: a real job id plus recorded pass AND verified cleanup.
+            # A caller-asserted status string is never sufficient.
+            if not job_id:
+                raise ValueError("automated pass requires a job id")
+            receipt = receipt or {}
+            if receipt.get("outcome") != "passed":
+                raise ValueError("automated pass requires a receipt with "
+                                 "outcome='passed'")
+            if receipt.get("cleanup") != "verified_empty":
+                raise ValueError("automated pass requires cleanup="
+                                 "'verified_empty'")
         entry = LedgerEntry(
             requirement_id=requirement_id, operation_id=self.requirements[requirement_id].operation_id,
             scope=self.requirements[requirement_id].scope, state=outcome,

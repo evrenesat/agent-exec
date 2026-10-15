@@ -48,16 +48,13 @@ def read_vitest_json(path: Path, *, expect_job_id: str | None = None) -> dict:
                                         for m in assertion.get("failureMessages", [])[:2]],
                 })
     failures = failures[:20]
-    complete = True
+    # Zero collected tests is incomplete evidence in every shape — whether
+    # the report carries empty suite results or structurally valid ones.
+    complete = total > 0
     notes = []
     if total == 0:
-        # An interrupted run can serialize a structurally valid empty report.
-        if not data.get("testResults"):
-            complete = False
-            notes.append("zero tests and no suite results: incomplete evidence, "
-                         "never a required-check pass")
-        else:
-            notes.append("zero collected tests: incomplete required check, not success")
+        notes.append("zero collected tests: incomplete evidence and an "
+                     "incomplete required check, never success")
     return {
         "kind": "vitest-json", "integrity": "valid", "complete": complete,
         "total": total, "passed": int(data["numPassedTests"]),
@@ -96,9 +93,11 @@ def read_junit_xml(path: Path) -> dict:
         failed += int(suite.get("failures", 0))
         errors += int(suite.get("errors", 0))
         skipped += int(suite.get("skipped", 0))
-    return {"kind": "junit", "integrity": "valid", "complete": True,
+    return {"kind": "junit", "integrity": "valid", "complete": total > 0,
             "total": total, "failed": failed, "errors": errors,
-            "skipped": skipped, "bytes": len(raw)}
+            "skipped": skipped, "bytes": len(raw),
+            "notes": ["zero tests reported: incomplete evidence, never success"]
+            if total == 0 else []}
 
 
 def summarize(reports: list[dict]) -> dict:
