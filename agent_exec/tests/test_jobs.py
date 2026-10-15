@@ -51,7 +51,19 @@ class FakeBackend:
                                  "cgroup": cgroup, "collected": True})
 
     def inspect(self, spec):
-        state = self.units[linux_jobs.unit_name(spec.job_id)]
+        # A unit systemd has never seen reports LoadState=not-found; mirror
+        # that instead of raising on unknown units.
+        state = self.units.get(linux_jobs.unit_name(spec.job_id))
+        if state is None:
+            return {"unit": linux_jobs.unit_name(spec.job_id),
+                    "load_state": "not-found", "active_state": None,
+                    "sub_state": None, "result": None, "exec_main_code": None,
+                    "exec_main_status": None, "invocation_id": None,
+                    "exit_record": None, "cgroup": "unknown",
+                    "observed_wall": 2.0, "phase": "inconclusive",
+                    "ended": True,
+                    "warning": "unit collected without a usable exit record; "
+                               "result unknown (never success)"}
         if self.manager_down:
             return {"unit": linux_jobs.unit_name(spec.job_id),
                     "load_state": "unknown", "active_state": None,

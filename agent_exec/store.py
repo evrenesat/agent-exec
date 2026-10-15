@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     boot_id TEXT,
     invocation_id TEXT,
     state TEXT NOT NULL,
+    launch_lease_until REAL,
     outcome TEXT,
     exit_record_json TEXT,
     cleanup TEXT,
@@ -79,11 +80,11 @@ class Store:
                 self._db.execute(
                     "INSERT INTO jobs (job_id, session_id, request_id, operation_id,"
                     " profile_id, purpose, unit, state, job_dir, deadline_seconds,"
-                    " stop_grace_seconds, created_wall, boot_id)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " stop_grace_seconds, created_wall, boot_id, launch_lease_until)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (job_id, session_id, request_id, operation_id, profile_id, purpose,
-                     unit, "queued", str(job_dir), deadline_seconds, stop_grace_seconds,
-                     time.time(), None))
+                     unit, "starting", str(job_dir), deadline_seconds,
+                     stop_grace_seconds, time.time(), None, None))
                 self._db.commit()
             except sqlite3.IntegrityError:
                 row = self._db.execute(
@@ -113,6 +114,24 @@ class Store:
             self._db.execute(f"UPDATE jobs SET {columns} WHERE job_id=?",
                              (*fields.values(), job_id))
             self._db.commit()
+
+    def update_job_if_state(self, job_id: str, states: tuple[str, ...],
+                            **fields) -> bool:
+        """Compare-and-set: apply fields only while the row is in one of
+        `states`. Returns False (and changes nothing) when another writer
+        already moved the row past them — terminal results are never
+        overwritten by a delayed launch update."""
+        if not fields:
+            return True
+        columns = ", ".join(f"{name}=?" for name in fields)
+        placeholders = ", ".join("?" for _ in states)
+        with self._lock:
+            cursor = self._db.execute(
+                f"UPDATE jobs SET {columns} WHERE job_id=? AND state IN ({placeholders})",
+                (*fields.values(), job_id, *states))
+            changed = cursor.rowcount > 0
+            self._db.commit()
+        return changed
 
     def open_jobs(self) -> list[dict]:
         with self._lock:

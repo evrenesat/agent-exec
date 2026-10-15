@@ -37,6 +37,9 @@ class UnknownJob(JobError):
 
 
 TERMINAL_STATES = {"completed"}
+# A launch reservation is "abandoned" only after this window; an in-flight
+# systemd-run is never raced into a blocked finalization.
+LAUNCH_LEASE_SECONDS = 120
 
 
 class JobController:
@@ -81,23 +84,45 @@ class JobController:
             existing = self.store.find_by_request(self.session_id, request_id)
             return {"job_id": existing["job_id"], "replayed": True,
                     "state": existing["state"]}
+        # Lease: a reservation is only "abandoned" (reconcilable to blocked)
+        # after this window; an in-flight systemd-run is never raced.
+        self.store.update_job(job_id, launch_lease_until=time.time()
+                              + LAUNCH_LEASE_SECONDS)
         spec.job_id = job_id
         try:
             meta = self.backend.launch(spec)
         except Exception as error:
-            self.store.update_job(job_id, state="completed", outcome="blocked",
-                                  terminal_wall=time.time(),
-                                  exit_record_json=None)
+            # CAS: only finalize if no other writer already did.
+            self.store.update_job_if_state(job_id, ("starting", "queued", "running"),
+                                           state="completed", outcome="blocked",
+                                           terminal_wall=time.time(),
+                                           exit_record_json=None)
             self.store.record_event(job_id, "terminal",
                                     {"outcome": "blocked", "error": str(error)[:300]})
             raise JobError(f"launch failed: {error}") from error
         # Persist the launch argv WITHOUT environment values: the journal is
         # not a secret store, and reconcile does not need them.
         redacted = [a for a in meta["launch_argv"] if not a.startswith("--setenv=")]
-        self.store.update_job(job_id, unit=meta["unit"], boot_id=meta["boot_id"],
-                              invocation_id=meta["invocation_id"], state="running",
-                              started_wall=meta["launch_wall"],
-                              launch_argv_json=json.dumps(redacted))
+        claimed = self.store.update_job_if_state(
+            job_id, ("starting", "queued"), unit=meta["unit"],
+            boot_id=meta["boot_id"], invocation_id=meta["invocation_id"],
+            state="running", started_wall=meta["launch_wall"],
+            launch_argv_json=json.dumps(redacted))
+        if not claimed:
+            row_now = self.store.get_job(job_id)
+            if row_now is not None and row_now["unit"] != "(unlaunched)":
+                # The row already references a unit (e.g. reconcile adopted
+                # this very launch during the crash window): the unit is
+                # owned by the journal — do NOT stop it, and do not fail.
+                return {"job_id": job_id, "replayed": True,
+                        "state": row_now["state"]}
+            # Truly orphaned: nobody owns this unit. Stop it and fail loudly.
+            try:
+                self.backend.stop(spec)
+            except Exception:  # noqa: BLE001 — best-effort orphan cleanup
+                pass
+            raise JobError("launch lost the state race; the job row was "
+                           "finalized concurrently and the unit was stopped")
         self.store.record_event(job_id, "launched",
                                 {"unit": meta["unit"], "invocation_id": meta["invocation_id"]})
         return {"job_id": job_id, "replayed": False, "state": "running"}
@@ -162,13 +187,64 @@ class JobController:
         return {"job_id": job_id, "state": row["state"],
                 "phase": observation["phase"], "unit": row["unit"]}
 
+    def _reconcile_unlaunched(self, job_id: str, row: dict) -> dict:
+        """Recover a reservation whose launch outcome is unknown.
+
+        A row with unit="(unlaunched)" may be (a) mid-launch in another
+        thread, (b) a unit that ran and was collected before its identity was
+        stored, or (c) genuinely abandoned. The lease protects (a); the
+        deterministic unit name (xtx-exec-<job_id>) distinguishes (b) from
+        (c) once the lease has expired.
+        """
+        lease = row.get("launch_lease_until") or 0
+        if time.time() < lease:
+            return {"reconciled": False,
+                    "reason": "launch lease still active; not finalizing"}
+        probe = self._spec_for(row)
+        observation = self.backend.inspect(probe)
+        if observation.get("phase") in ("running", "starting", "finishing",
+                                        "terminal"):
+            # The launch DID happen; adopt the unit and continue normally.
+            claimed = self.store.update_job_if_state(
+                job_id, ("starting", "queued"), unit=observation["unit"],
+                state="running", started_wall=time.time())
+            if not claimed:
+                row = self.store.get_job(job_id)
+                if row["state"] in TERMINAL_STATES:
+                    return {"reconciled": True, "receipt": self._receipt(row)}
+            refreshed = self.store.get_job(job_id)
+            observation = self.backend.inspect(self._spec_for(refreshed))
+            if observation["phase"] == "terminal":
+                return {"reconciled": True, "receipt":
+                        self._absorb_terminal(job_id, refreshed, probe, observation)}
+            if observation.get("phase") == "inconclusive" and observation.get("ended"):
+                return {"reconciled": True, "receipt":
+                        self._finalize_inconclusive(job_id, observation)}
+            return {"reconciled": False, "reason":
+                    f"adopted launched unit; still {observation['phase']}"}
+        if observation.get("load_state") == "unknown":
+            return {"reconciled": False, "reason": "manager communication failed; retry later"}
+        # Lease expired and the deterministic unit does not exist: the launch
+        # never completed. CAS-finalize blocked.
+        if self.store.update_job_if_state(job_id, ("starting", "queued"),
+                                          state="completed", outcome="blocked",
+                                          terminal_wall=time.time()):
+            self.store.record_event(job_id, "reconciled",
+                                    {"outcome": "blocked",
+                                     "reason": "launch never confirmed "
+                                               "(no unit after lease expiry)"})
+            return {"reconciled": True, "receipt": self._receipt(self.store.get_job(job_id))}
+        row = self.store.get_job(job_id)
+        return {"reconciled": True, "receipt": self._receipt(row)}
+
     def _finalize_inconclusive(self, job_id: str, observation: dict) -> dict:
         import json as _json
         record = _json.dumps(observation.get("exit_record"))
-        self.store.update_job(job_id, state="completed", outcome="inconclusive",
-                              exit_record_json=record,
-                              cleanup=observation.get("cgroup", "unknown"),
-                              terminal_wall=time.time())
+        self.store.update_job_if_state(job_id, ("starting", "queued", "running"),
+                                       state="completed", outcome="inconclusive",
+                                       exit_record_json=record,
+                                       cleanup=observation.get("cgroup", "unknown"),
+                                       terminal_wall=time.time())
         self.store.record_event(job_id, "reconciled", {
             "outcome": "inconclusive", "cleanup": observation.get("cgroup"),
             "reason": observation.get("warning") or "missing usable exit evidence"})
@@ -193,8 +269,9 @@ class JobController:
             "freshness": "fresh",
         }
         import json as _json
-        self.store.update_job(
-            job_id, state="completed", outcome=verdict["outcome"],
+        self.store.update_job_if_state(
+            job_id, ("starting", "queued", "running"),
+            state="completed", outcome=verdict["outcome"],
             exit_record_json=_json.dumps(observation.get("exit_record")),
             cleanup=verdict["cleanup"], terminal_wall=receipt["terminal_wall"])
         self.store.record_event(job_id, "terminal", {
@@ -297,15 +374,7 @@ class JobController:
             return {"reconciled": False, "reason": "already terminal",
                     "receipt": self._receipt(row)}
         if row["unit"] == "(unlaunched)":
-            # Reserved but launch never confirmed (controller crash between
-            # reservation and systemd-run). No unit can exist for this row;
-            # finalize blocked rather than leave it open forever.
-            self.store.update_job(job_id, state="completed", outcome="blocked",
-                                  terminal_wall=time.time())
-            self.store.record_event(job_id, "reconciled",
-                                    {"outcome": "blocked",
-                                     "reason": "launch never confirmed (unit unlaunched)"})
-            return {"reconciled": True, "receipt": self._receipt(self.store.get_job(job_id))}
+            return self._reconcile_unlaunched(job_id, row)
         spec = self._spec_for(row)
         outcome = self.backend.reconcile(spec,
                                          cancel_requested=bool(row["cancel_requested"]))
