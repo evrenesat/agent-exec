@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "profile_id": "doublangu-web-unit",
+  "project": "doublangu",
+  "component": "web",
+  "operation": "unit",
+  "status": "draft",
+  "host": {"hostname": "codex", "os": "linux", "arch": "x86_64"},
+  "environment": {
+    "node": {"minimum": 24, "reason": "declared Node minimum"},
+    "package_manager": "npm",
+    "vitest": {"spec": "4.1.10 (lockfile)",
+               "forbidden_flags": ["--poolOptions.*"],
+               "reason": "poolOptions was removed in Vitest 4; only supported top-level options are renderable"}
+  },
+  "command": {
+    "argv_template": ["npm", "--prefix", "web", "run", "test:unit"],
+    "cwd": "{source_root}",
+    "note": "preserves package lifecycle scripts; check/build/validate:openapi/generate:api are separate operations subordinate to make verify"
+  },
+  "selectors": {
+    "allowed_kinds": ["file"],
+    "base": "web/src",
+    "note": "runner passes filters via its own script contract; unverified until admission"
+  },
+  "reports": [
+    {"kind": "vitest-json", "path_template": "{report_dir}/vitest-json.json", "admitted": false}
+  ],
+  "deadlines": {"diagnose_seconds": 120, "hard_seconds": 600},
+  "isolation": {
+    "checkout_mutex": "Svelte sync/build/check and E2E must serialize per checkout",
+    "network": "denied at test time; generation prerequisites are separate owned stages"
+  },
+  "capabilities": {
+    "supports_coalescing": false,
+    "supports_reuse": false,
+    "supports_incremental_report": false,
+    "requires_external_state": {"enabled": false,
+      "reason": "unit scope only; E2E/browser and Go-backed prerequisites are separate drafts"},
+    "needs_private_host": false
+  },
+  "inputs": {
+    "fingerprints": ["web/src/**", "web/package.json", "web/package-lock.json", "web/vite.config.*"],
+    "generated": ["generated API/Svelte outputs own their existing recipes"],
+    "excluded_outputs": ["web/node_modules", "web/.svelte-kit", "web/dist"]
+  },
+  "notes": ["draft: admission requires resolving the pinned Go 1.26.5 toolchain and the declared checkout mutex; never copy AFlow Vitest 1 flags into this profile"]
+}

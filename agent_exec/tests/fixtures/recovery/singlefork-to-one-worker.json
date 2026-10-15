@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "case_id": "singlefork-to-one-worker",
+  "description": "singleFork timeout then a registered isolated one-worker variant: same recovery goal, meaningfully different execution (distinct execution key); allowed once as the registered alternative, never a result reuse.",
+  "labels": {
+    "must_block": false,
+    "must_not_block": true,
+    "advisory": false
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1",
+      "variant": "singleFork"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "timed_out"
+    },
+    {
+      "type": "launch",
+      "request_id": "r2",
+      "variant": "one-worker-forks",
+      "registered_recovery_variant": true
+    }
+  ]
+}

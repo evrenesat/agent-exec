@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "profile_id": "aflow-web-p100",
+  "project": "aflow",
+  "component": "web",
+  "operation": "unit",
+  "status": "fixture_verified",
+  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-aflow-web/admission-receipt.json",
+  "host": {
+    "hostname": "codex",
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "source_binding": {
+    "policy": "job-supplied owned copy; production /root/code/agent_flow is never a scored source root",
+    "reference_head": "ebc64fb78a745f33908c7979fb6eb9a66d8c129e",
+    "task_state_reference": "9d89c980839c83fe322c11d9591e127ceeb02f1c"
+  },
+  "environment": {
+    "node": {"path": "/opt/node-v24.20.0-linux-x64/bin/node", "version": "v24.20.0"},
+    "package_manager": "npm",
+    "lockfile": "apps/aflow_app/web/package-lock.json",
+    "vitest": {"spec": "^1.0.0", "locked": "1.6.1",
+               "forbidden_flags": ["--singleFork"],
+               "forbidden_config": ["poolOptions.forks.singleFork"],
+               "reason": "singleFork changes isolation and is only a config-level option on 1.6.1 (the CLI flag fails fast with CACError); only isolated one-worker forks are admitted for this profile"}
+  },
+  "command": {
+    "argv_template": [
+      "npm", "--prefix", "apps/aflow_app/web", "test", "--", "--run",
+      "--maxWorkers=1", "--minWorkers=1", "--pool=forks",
+      "--reporter=json", "--outputFile={report_dir}/vitest-json.json"
+    ],
+    "cwd": "{source_root}",
+    "selectors": "appended after the template as separate argv elements (vitest filename filters)"
+  },
+  "selectors": {
+    "allowed_kinds": ["file", "directory"],
+    "base": "apps/aflow_app/web/src",
+    "note": "empty selection means the full suite; zero collected tests is an incomplete required check, never success"
+  },
+  "preparation": [
+    {
+      "kind": "npm_lifecycle",
+      "script": "pretest",
+      "runs": "npm run changelog",
+      "generates": [
+        "apps/aflow_app/web/src/generated/changelog.json",
+        "CHANGELOG.md"
+      ],
+      "inputs": ["DEVLOG.md"],
+      "authority": "npm owns the lifecycle; the job layer verifies generated outputs exist afterward and never runs the generator a second time"
+    }
+  ],
+  "reports": [
+    {"kind": "vitest-json", "path_template": "{report_dir}/vitest-json.json", "admitted": false}
+  ],
+  "deadlines": {
+    "diagnose_seconds": 60,
+    "hard_seconds": 180,
+    "status": "proposed, conditional on three valid admission runs showing margin; full-suite runs may legitimately exceed this and need their own operation"
+  },
+  "isolation": {
+    "sandbox": "established bwrap recipe (unshare-pid/net/ipc/uts, cap-drop ALL) inside a uniquely named transient systemd unit",
+    "network": "denied",
+    "workers": 1,
+    "resource_mutex": "none (single-sequence test execution; browser journeys are separate operations)"
+  },
+  "inputs": {
+    "fingerprints": [
+      "apps/aflow_app/web/src/**",
+      "apps/aflow_app/web/package.json",
+      "apps/aflow_app/web/package-lock.json",
+      "apps/aflow_app/web/vite.config.ts",
+      "apps/aflow_app/web/scripts/generate-changelog.mjs",
+      "DEVLOG.md"
+    ],
+    "generated": [
+      "apps/aflow_app/web/src/generated/changelog.json",
+      "CHANGELOG.md"
+    ],
+    "excluded_outputs": ["apps/aflow_app/web/node_modules", "apps/aflow_app/web/dist"]
+  },
+  "capabilities": {
+    "supports_coalescing": {"enabled": false,
+      "reason": "disabled for the first slice by plan; exact in-flight coalescing is a later admitted feature"},
+    "supports_reuse": {"enabled": false,
+      "reason": "completed-pass reuse off until determinism and mutation fixtures pass"},
+    "supports_incremental_report": {"enabled": false,
+      "reason": "final vitest JSON report only; incremental JSONL events need separate admission"},
+    "requires_external_state": {"enabled": false,
+      "reason": "unit tests are offline; browser/server operations are separate profiles"},
+    "needs_private_host": false
+  },
+  "variant_defaults": {
+    "default": {"note": "canonical isolated one-worker forks"}
+  },
+  "notes": [
+    "profile lifecycle authority stays with npm; the supervisor never bypasses pretest",
+    "reporter admission (JSON, optional JUnit) happens in checkpoint 3 calibration; both are marked unadmitted until then"
+  ]
+}

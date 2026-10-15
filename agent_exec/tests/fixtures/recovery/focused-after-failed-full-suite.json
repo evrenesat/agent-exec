@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "case_id": "focused-after-failed-full-suite",
+  "description": "A focused diagnostic requested after a failed full suite, citing the parent job: a distinct execution that never counts as full coverage; always allowed.",
+  "labels": {
+    "must_block": false,
+    "must_not_block": true,
+    "advisory": false
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "failed",
+      "failure_class": "assertion"
+    },
+    {
+      "type": "launch",
+      "request_id": "r2",
+      "intended_scope": "focused:src/app.test.ts",
+      "purpose": "diagnose",
+      "parent_job_id": "job-0001"
+    }
+  ]
+}

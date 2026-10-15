@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "case_id": "empty-log-no-evidence-abstains",
+  "description": "An empty log read followed by a repeat while the job still runs: no failure evidence exists, so this is not proof of a loop or stall; the policy abstains and awaits a real state event.",
+  "labels": {
+    "must_block": false,
+    "must_not_block": true,
+    "advisory": true
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "log_read",
+      "job_ref": "r1",
+      "new_bytes": 0
+    },
+    {
+      "type": "launch",
+      "request_id": "r2"
+    }
+  ]
+}

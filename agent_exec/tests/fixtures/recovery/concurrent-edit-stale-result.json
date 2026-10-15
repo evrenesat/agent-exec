@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "case_id": "concurrent-edit-stale-result",
+  "description": "Inputs changed while the job ran (concurrent edit): the passing result is stale, reuse is ineligible, and the fresh launch abstains rather than blocking.",
+  "labels": {
+    "must_block": false,
+    "must_not_block": true,
+    "advisory": true
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "passed",
+      "concurrent_edit": true
+    },
+    {
+      "type": "launch",
+      "request_id": "r2"
+    }
+  ],
+  "flags": {
+    "reuse": true
+  }
+}

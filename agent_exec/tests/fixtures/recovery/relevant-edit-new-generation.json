@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "case_id": "relevant-edit-new-generation",
+  "description": "A failed run followed by a verified relevant source edit: a new recovery generation (fresh goal budget) is allowed; the task-level budget is not reset.",
+  "labels": {
+    "must_block": false,
+    "must_not_block": true,
+    "advisory": false
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "failed",
+      "failure_class": "assertion"
+    },
+    {
+      "type": "edit_verified",
+      "source_fingerprint": "meta-src-B",
+      "relevant_inputs_fingerprint": "meta-rel-B"
+    },
+    {
+      "type": "launch",
+      "request_id": "r2"
+    }
+  ]
+}

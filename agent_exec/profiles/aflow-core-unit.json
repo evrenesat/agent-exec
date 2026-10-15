@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "profile_id": "aflow-core-unit",
+  "project": "aflow",
+  "component": "core",
+  "operation": "unit",
+  "status": "draft",
+  "host": {"hostname": "codex", "os": "linux", "arch": "x86_64"},
+  "environment": {
+    "python": {"spec": ">=3.11", "note": "root environment distinct from server (>=3.12)"},
+    "runner": "uv + pytest",
+    "policy": "preserve existing uv/pytest/Ruff configuration; no xdist imposition; addopts preserved verbatim"
+  },
+  "command": {
+    "argv_template": [
+      "uv", "run", "--locked", "--no-sync", "python", "-m", "pytest",
+      "-q", "--junitxml={report_dir}/junit.xml"
+    ],
+    "cwd": "{source_root}",
+    "note": "test calls use the already prepared environment and make no dependency changes"
+  },
+  "selectors": {
+    "allowed_kinds": ["file", "directory"],
+    "base": "tests",
+    "note": "zero collected tests is an incomplete required check, never success"
+  },
+  "reports": [
+    {"kind": "junit", "path_template": "{report_dir}/junit.xml", "admitted": false}
+  ],
+  "deadlines": {"diagnose_seconds": 300, "hard_seconds": 1800,
+                "note": "full suites can legitimately take tens of minutes; independent limits required"},
+  "capabilities": {
+    "supports_coalescing": false,
+    "supports_reuse": false,
+    "supports_incremental_report": {"enabled": false,
+      "reason": "pytest-reportlog needs separate pinned admission"},
+    "requires_external_state": false,
+    "needs_private_host": false
+  },
+  "inputs": {
+    "fingerprints": ["tests/**", "pyproject.toml", "uv.lock"],
+    "generated": [],
+    "excluded_outputs": [".venv", ".pytest_cache", ".ruff_cache"]
+  },
+  "notes": ["draft: admission requires actual interpreter/dependency-group inventory on an owned copy; markers/live/cassette policies must be preserved"]
+}

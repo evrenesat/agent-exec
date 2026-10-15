@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "case_id": "readme-only-edit-code-profile",
+  "description": "A failed code-profile run followed by a README-only edit: the whole-tree fingerprint changed but the profile-declared relevant-input generation did not, so the identical repeat returns the prior failure receipt (no reset for a code-only profile).",
+  "labels": {
+    "must_block": true,
+    "must_not_block": false,
+    "advisory": false
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "failed",
+      "failure_class": "assertion"
+    },
+    {
+      "type": "edit_verified",
+      "source_fingerprint": "meta-src-C",
+      "relevant_inputs_fingerprint": "meta-rel-A"
+    },
+    {
+      "type": "launch",
+      "request_id": "r2"
+    }
+  ]
+}

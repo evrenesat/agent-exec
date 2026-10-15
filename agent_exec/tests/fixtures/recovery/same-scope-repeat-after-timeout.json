@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "same-scope-repeat-after-timeout",
+  "description": "First full-suite run times out; the one unchanged-goal recovery attempt is allowed and also times out; a third unchanged attempt is blocked (recovery_budget_exhausted).",
+  "labels": {
+    "must_block": true,
+    "must_not_block": false,
+    "advisory": false
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "timed_out"
+    },
+    {
+      "type": "launch",
+      "request_id": "r2"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r2",
+      "outcome": "timed_out"
+    },
+    {
+      "type": "launch",
+      "request_id": "r3"
+    }
+  ]
+}

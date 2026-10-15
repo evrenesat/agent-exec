@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "profile_id": "cdx-unit",
+  "project": "cdx",
+  "component": "core",
+  "operation": "unit",
+  "status": "fixture_verified",
+  "host": {
+    "hostname": "codex",
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "environment": {
+    "go": {
+      "spec": "1.24+ per go.mod; validated with pinned go1.24.13 at /opt/go1.24-execution-layer (tarball sha256 1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730 verified against go.dev/dl metadata)",
+      "toolchain_policy": "frozen no-auto-upgrade environment: GOTOOLCHAIN=local, no implicit toolchain downloads inside a test; validation used GOCACHE/GOPATH under /var/lib/xtx-benchmarks/execution-layer-20261013/feasibility/F-go/scratch"
+    }
+  },
+  "command": {
+    "argv_template": [
+      "/bin/sh",
+      "-c",
+      "CGO_ENABLED=0 GOTOOLCHAIN=local /opt/go1.24-execution-layer/bin/go test -json -count=1 -buildvcs=false ./... > {report_dir}/go-test.jsonl 2>&1"
+    ],
+    "cwd": "{source_root}",
+    "note": "-count=1 executes tests while retaining the compiler build cache; cached results are labeled cached via the '(cached)' package summary line (go1.24.13 replays === RUN events on cache hits, so run-event absence is not a valid cached signal)",
+    "verified_observation": "go test -json -count=1 ./... exit 0 at HEAD d786fc68ad7e5e5478ea448682c32da7ca9a8a61: 29 tests executed and passed (internal/cli 5, internal/codexstate 24); 4 packages reported skip [no test files]",
+    "env_note": "GOCACHE/GOPATH are set per job by the admission runner under the evidence root; GIT_CONFIG safe.directory entries are injected by the runner for owned copies"
+  },
+  "selectors": {
+    "allowed_kinds": [
+      "directory"
+    ],
+    "base": "",
+    "note": "package selectors only; packages with no test files are not whole-project success"
+  },
+  "reports": [
+    {
+      "kind": "go-test-json",
+      "path_template": "{report_dir}/go-test.jsonl",
+      "admitted": false
+    }
+  ],
+  "deadlines": {
+    "diagnose_seconds": 120,
+    "hard_seconds": 900
+  },
+  "capabilities": {
+    "supports_coalescing": false,
+    "supports_reuse": false,
+    "supports_incremental_report": {
+      "enabled": true,
+      "reason": "native -json stream yields package/test events before the stream ends; final receipt still requires exit plus complete stream"
+    },
+    "requires_external_state": false,
+    "needs_private_host": false
+  },
+  "inputs": {
+    "fingerprints": [
+      "**.go",
+      "go.mod",
+      "go.sum"
+    ],
+    "generated": [],
+    "excluded_outputs": [
+      "bin",
+      ".gocache"
+    ]
+  },
+  "notes": [
+    "draft: do not flip to admitted from this validation; admission owns the status flip",
+    "verified 2026-10-15 on owned copy /root/code/worktrees/execution-cdx-owned-20261014 (HEAD d786fc68ad7e5e5478ea448682c32da7ca9a8a61, clean): no Makefile and no CI workflows; AGENTS.md documents go build ./cmd/cdx, go test ./..., go vet ./..., go test -race ./...",
+    "CGO_ENABLED=0 confirmed: no 'import \"C\"' and no runtime/cgo imports anywhere; CGO_ENABLED=0 go vet ./... exit 0 and CGO_ENABLED=0 go build -o <scratch>/cdx ./cmd/cdx exit 0 (binary runs, 'cdx version' -> dev)",
+    "owned-copy builds need VCS-stamp resolution: the go tool's internal 'git status' hits 'dubious ownership' (repo dir owned by a non-root uid); fixes verified: GIT_CONFIG_COUNT=1 safe.directory env, or go build -buildvcs=false; repo-documented command otherwise unchanged",
+    "go vet ./... is part of the repo's own verification ('go test ./... && go vet ./...'); treat as a separate operation, not folded into unit",
+    "race check (go test -race ./...) is documented but was NOT run here; race builds may need CGO/linker support on some platforms - record as a separate variant, production no-CGO gate preserved",
+    "no build tags, no go:generate generators, no workspace file; module deps (cobra, modernc.org/sqlite pure-Go) download once via proxy into the frozen GOPATH, go.sum-verified; tests then run offline on synthetic fixtures",
+    "observed caching behavior: cdx test packages re-execute even without -count=1 in the frozen env (t.TempDir() fixture opens change the result-cache key; a trivial scratch package does show '(cached)', so the env supports caching); -count=1 matches observed reality",
+    "packages with no test files surface as package-level Action 'skip' (cmd/cdx, internal/buildinfo, internal/exitcode, internal/testutil) and are counted separately, never as whole-project test success",
+    "evidence: /var/lib/xtx-benchmarks/execution-layer-20261013/feasibility/F-go/proof/go-admission-receipt.json and scratch/go-validation-log.txt",
+    "admission shares one prepared GOMODCACHE+GOCACHE across repeats (warm build cache is the repeat contract; -count=1 still executes tests)"
+  ],
+  "preparation": [
+    {
+      "kind": "go_mod_download",
+      "script": "CGO_ENABLED=0 GOTOOLCHAIN=local go mod download",
+      "authority": "go owns dependency lifecycle; test calls never download modules (no 'go: downloading' lines in scored streams)",
+      "outputs": [
+        "shared GOMODCACHE under the admission evidence root"
+      ]
+    }
+  ],
+  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-cdx/admission-receipt.json"
+}

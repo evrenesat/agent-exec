@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "case_id": "request-retransmission-idempotent",
+  "description": "The same transport request ID retransmitted while the job runs returns the original job: idempotent, never a block, never a second process.",
+  "labels": {
+    "must_block": false,
+    "must_not_block": true,
+    "advisory": false
+  },
+  "request": {
+    "project": "aflow",
+    "component": "web",
+    "operation": "unit",
+    "operation_family": "unit",
+    "variant": "default",
+    "purpose": "verify",
+    "intended_scope": "full-suite",
+    "source_fingerprint": "meta-src-A",
+    "relevant_inputs_fingerprint": "meta-rel-A",
+    "environment_fingerprint": "meta-env-1",
+    "environment_class": "p100-web"
+  },
+  "events": [
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "launch",
+      "request_id": "r1"
+    },
+    {
+      "type": "complete",
+      "job_ref": "r1",
+      "outcome": "passed"
+    }
+  ]
+}
