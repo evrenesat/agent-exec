@@ -17,6 +17,8 @@ python3 -m agent_exec.cli selftest --backend linux --output <dir>   # real-syste
 ```
 
 - Always pass a stable `--request-id`: replaying it returns the same job instead of launching a second one (this is the only dedupe that exists).
+- Sessions persist across CLI invocations (`--session-id` > `AGENT_EXEC_SESSION_ID` > `~/.agent-exec/session-id`); embedded callers pass explicit ids.
+- Supervisor operations marked `scored` must bind an admitted profile — the command is rendered from the profile and its admission receipt is verified (identity, repeat count, pass); you cannot smuggle raw argv into a scored path.
 - `--deadline-seconds` is required and positive. There is no unbounded mode; if you need longer, that's a different operation profile with its own admitted deadline.
 - An elapsed `wait` cancels nothing and proves nothing. If a receipt is `inconclusive`, say so and stop — do not treat it as success or retry blindly.
 - Store/evidence locations default to the p100 paths; on other hosts pass `--store` and `--evidence-root` explicitly.

@@ -40,8 +40,12 @@ One job = one uniquely named transient systemd unit, launched detached
 Why the hook: `systemctl show` on a collected unit returns success-mimicking
 defaults (measured: `Result=success`, `0:0` for a timed-out-and-collected
 unit), and quiet successful units leave no journal entries. Missing record +
-not-found unit ⇒ `inconclusive`, never success. `--pipe` units additionally
-leave no journal trail at all — detached launches only.
+not-found unit ⇒ `inconclusive`, never success — and because not-found means
+the unit is definitively gone, such jobs are **finalized** as inconclusive
+with the reason persisted (idempotent under repeated reconciliation); transient
+manager failures (`LoadState=unknown`) are reported and never finalize.
+A pass additionally requires verified-empty cgroup cleanup. `--pipe` units
+additionally leave no journal trail at all — detached launches only.
 
 Cleanup truth = the unit's cgroup is absent/empty (`/sys/fs/cgroup/system.slice/<unit>`),
 checked on every terminal classification.
@@ -60,8 +64,10 @@ inferred passes.
 ## Reports and verification
 
 Report readers classify only what the format proves: missing/empty/truncated =
-incomplete; zero collected tests = incomplete required check; failure evidence
-preserved. The ledger (`verification.py`) binds requirements to freshest
+incomplete; zero collected tests = incomplete in every shape (vitest and
+junit); failure evidence preserved. Log reads advance their cursor only past
+accepted entries (a budget-excluded entry is re-read by a larger read; an
+oversized single entry is flagged and explicitly skipped). The ledger (`verification.py`) binds requirements to freshest
 receipts; a manifest with anything not fresh-passed is `complete: false`.
 Manual acceptance is declared, never self-certified.
 
@@ -76,10 +82,16 @@ before any enforcement flip. Unknown fingerprints ⇒ abstain.
 
 ## Harness path
 
-Supervisor (HTTP, loopback, operations-allowlist) over the controller; plugins
-poll `/events` with a cursor; the supervisor reconciles live jobs before
-serving, making polling self-driving. Bounded waits absorb in one model turn —
-measured: an 86-poll wait replaced what would have been model-turn polling.
+Supervisor (HTTP, loopback, per-session token on every route, operations-
+allowlist) over the controller; request ids are strictly validated and become
+contained filesystem paths; callers cannot alter environments or exceed
+operation deadlines; scored operations must bind an admitted profile whose
+receipt is verified (identity sha or normalized argv). Plugins poll `/events`
+with a cursor; the supervisor reconciles live jobs before serving, making
+polling self-driving. Waits are job-specific — a terminal event settles only
+its own job's wait, and an expired wait is an explicit inconclusive. Bounded
+waits absorb in one model turn — measured: an 86-poll wait replaced what would
+have been model-turn polling.
 
 ## Deliberate non-features
 

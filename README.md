@@ -43,9 +43,12 @@ python3 -m agent_exec.cli selftest --backend linux --output /tmp/exec-selftest
 
 ## Guarantees worth knowing
 
-- A job never runs without a positive hard deadline.
-- "Success" requires the durable exit record **and** verified-empty cgroup cleanup.
-- A collected-away unit with no exit record is `inconclusive` — never success.
+- A job never runs without a positive hard deadline; callers may shorten an operation's deadline, never exceed it.
+- "Success" requires the durable exit record **and** verified-empty cgroup cleanup — either missing means `inconclusive`, and ended jobs are finalized (never left "running") with the reason stored.
+- CLI sessions persist across invocations (`--session-id`, env, or `~/.agent-exec/session-id`), so launch → status → wait → cancel work from separate shells.
+- The supervisor requires a per-session token on every route; request ids are strictly validated; callers cannot alter the environment, and scored operations must bind an admitted profile whose receipt is verified (changed command ⇒ re-admission required).
+- An agent's `project_run` result is always attributed to its own job — concurrent completions from other jobs can never be mistaken for yours, and an expired wait is an explicit `inconclusive`.
+- Reports with zero collected tests are incomplete evidence, never success; ledger passes derive from real job receipts.
 - Cancellation stops exactly that unit; no process-name kills, ever.
 - Coalescing / result-reuse / "this looks like a loop" enforcement are **off** by default; the recovery policy ships in observe-only mode with a zero-false-block test gate before any enforcement.
 
