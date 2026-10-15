@@ -24,6 +24,7 @@ from .profiles import load_profile
 
 DEFAULT_ROOT = Path("/var/lib/xtx-benchmarks/execution-layer-20261013")
 NODE_BIN = "/opt/node-v24.20.0-linux-x64/bin"
+REQUIRED_ADMISSION_REPEATS = 3
 
 
 def check_storage(output: Path) -> dict:
@@ -105,10 +106,13 @@ def run_admission(profile_path: Path, repeats: int, output: Path,
         and all(r["generated_outputs_present"].values())
         for r in runs)
     margins = [rendered.deadlines["hard_seconds"] for _ in runs]
+    import hashlib as _hashlib
     receipt = {
         "schema_version": 1,
         "admission": profile["profile_id"],
         "status_before": profile["status"],
+        "repeats": len(runs),
+        "profile_sha256": _hashlib.sha256(profile_path.read_bytes()).hexdigest(),
         "source_root": str(source_root),
         "source_policy": "owned copy; production checkout never scored",
         "storage_before": storage,
@@ -145,6 +149,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profiles-dir", type=Path,
                         default=Path(__file__).resolve().parent / "profiles")
     args = parser.parse_args(argv)
+    if args.repeats < REQUIRED_ADMISSION_REPEATS:
+        print(f"admission error: --repeats must be >= "
+              f"{REQUIRED_ADMISSION_REPEATS} (got {args.repeats}); a shorter "
+              f"run can never satisfy the calibration gate", file=sys.stderr)
+        return 2
     profile_path = args.profiles_dir / f"{args.profile}.json"
     try:
         receipt = run_admission(profile_path, args.repeats, args.output,

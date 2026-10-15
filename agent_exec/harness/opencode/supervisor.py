@@ -27,8 +27,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from agent_exec.contracts import render
 from agent_exec.jobs import JobController, JobError  # noqa: E402
 
 
@@ -38,12 +39,49 @@ MAX_DEADLINE_SECONDS = 3600
 
 class Supervisor:
     def __init__(self, controller: JobController, operations: dict | None = None,
-                 *, token: str | None = None, max_deadline_seconds: int = MAX_DEADLINE_SECONDS):
+                 *, token: str | None = None,
+                 max_deadline_seconds: int = MAX_DEADLINE_SECONDS,
+                 profiles_dir: Path | None = None):
         self.controller = controller
         self.operations = operations or {}
         self.token = token
         self.max_deadline_seconds = max_deadline_seconds
+        self.profiles_dir = Path(profiles_dir) if profiles_dir else \
+            Path(__file__).resolve().parents[2] / "profiles"
         self.launch_count = 0
+
+    def resolve_operation_command(self, operation: str, spec: dict,
+                                  request_id: str, report_dir: Path) -> tuple[list[str], int, str]:
+        """Admission-enforced command resolution.
+
+        Operations bound to a profile render their command FROM the profile
+        and (when scored) require an admitted profile with an intact receipt.
+        Legacy argv operations are allowed only as unscored
+        calibration/diagnostic work.
+        """
+        profile_id = spec.get("profile_id")
+        if not profile_id:
+            return list(spec["argv"]), int(spec.get("deadline_seconds", 120)), \
+                "unscored: no profile bound"
+        from agent_exec.profiles import load_profile, verify_admission
+        profile_path = self.profiles_dir / f"{profile_id}.json"
+        if not profile_path.is_file():
+            raise JobError(f"bound profile not found: {profile_id}")
+        profile = load_profile(profile_path)
+        scored = bool(spec.get("scored", False))
+        errors = verify_admission(profile, scored=scored, profile_path=profile_path)
+        if errors:
+            raise JobError(f"admission enforcement failed for {profile_id}: "
+                           + "; ".join(errors))
+        source_root = spec.get("source_root")
+        if not source_root:
+            raise JobError(f"operation {operation!r} binds a profile but has "
+                           "no source_root")
+        rendered = render(profile, source_root=str(source_root), job_id=request_id,
+                          report_dir=str(report_dir),
+                          selectors=spec.get("selectors") or None)
+        return list(rendered.argv), rendered.deadlines["hard_seconds"], \
+            f"admitted:{profile_id}"
 
     def validate_request_id(self, request_id: str) -> str:
         """Restrictive id policy: it becomes part of a filesystem path."""
@@ -122,6 +160,9 @@ class Supervisor:
         deadline = min(deadline, self.max_deadline_seconds)
         if deadline <= 0:
             raise JobError("deadline must be positive")
+        if "argv" in spec and spec.get("scored"):
+            raise JobError("scored operations must bind an admitted profile, "
+                           "not a raw argv")
         # Per-job report dir: "{report_dir}" tokens in the operation argv are
         # replaced with a job-owned path so concurrent jobs never share files.
         # Defense in depth beyond the request_id regex: the resolved path must
@@ -129,11 +170,21 @@ class Supervisor:
         report_dir = self.job_dir_for(self.controller.session_id,
                                       request_id) / "reports"
         report_dir.mkdir(parents=True, exist_ok=True)
-        argv = [part.replace("{report_dir}", str(report_dir)) for part in spec["argv"]]
+        if "argv" in spec and not spec.get("profile_id"):
+            argv = [part.replace("{report_dir}", str(report_dir))
+                    for part in spec["argv"]]
+        else:
+            argv, profile_deadline, origin = self.resolve_operation_command(
+                operation, spec, request_id, report_dir)
+            deadline = min(deadline if requested is not None else profile_deadline,
+                           profile_deadline, self.max_deadline_seconds)
         result = self.controller.launch(
             argv, request_id=str(request_id), operation_id=operation,
             deadline_seconds=deadline, stop_grace_seconds=5, env=env,
             profile_id=spec.get("profile_id"), cwd=cwd)
+        result["command_origin"] = ("admitted:" + spec["profile_id"]
+                                    if spec.get("profile_id") else
+                                    "unscored:legacy-argv")
         return result
 
 
