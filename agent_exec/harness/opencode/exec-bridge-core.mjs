@@ -12,8 +12,10 @@ export const DEFAULTS = {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class BridgeCore {
-  constructor({ supervisorUrl, log = () => {}, options = {}, fetchImpl = fetch }) {
+  constructor({ supervisorUrl, token = null, log = () => {}, options = {},
+                fetchImpl = fetch }) {
     this.supervisorUrl = supervisorUrl.replace(/\/$/, "");
+    this.token = token;
     this.log = log;
     this.options = { ...DEFAULTS, ...options };
     this.fetchImpl = fetchImpl.bind(globalThis);
@@ -23,11 +25,17 @@ export class BridgeCore {
     this.pollErrors = 0;
   }
 
+  headers(extra = {}) {
+    return this.token
+      ? { "X-Agent-Exec-Token": this.token, ...extra } : extra;
+  }
+
   async pollOnce() {
     this.polls += 1;
     const res = await this.fetchImpl(
       `${this.supervisorUrl}/events?cursor=${this.cursor}`,
-      { signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
+      { headers: this.headers(),
+        signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
     if (!res.ok) throw new Error(`supervisor_http_${res.status}`);
     const data = await res.json();
     this.cursor = data.cursor ?? this.cursor;
@@ -85,7 +93,7 @@ export class BridgeCore {
   async launchOperation(operation, { requestId, deadlineSeconds } = {}) {
     const res = await this.fetchImpl(`${this.supervisorUrl}/jobs`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: this.headers({ "Content-Type": "application/json" }),
       body: JSON.stringify({ operation, request_id: requestId,
         deadline_seconds: deadlineSeconds }),
       signal: AbortSignal.timeout(this.options.pollTimeoutMs),
@@ -98,7 +106,8 @@ export class BridgeCore {
 
   async fetchJob(jobId) {
     const res = await this.fetchImpl(`${this.supervisorUrl}/jobs/${jobId}`,
-      { signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
+      { headers: this.headers(),
+        signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`job_fetch_failed_${res.status}`);
     return data;

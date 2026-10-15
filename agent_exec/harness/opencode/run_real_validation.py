@@ -79,6 +79,7 @@ def main() -> int:
     line = supervisor.stdout.readline()
     info = json.loads(line)
     supervisor_url = info["listening"]
+    token = info["token"]
     wait_health(supervisor_url + "/health")
 
     for name in ("package.json", "package-lock.json"):
@@ -108,6 +109,7 @@ def main() -> int:
     (config_dir / "xtx-exec-bridge.json").write_text(json.dumps({
         "supervisorName": "execution-layer",
         "supervisorUrl": supervisor_url,
+        "token": token,
         "pollIntervalMs": 250,
         "pollTimeoutMs": 3000,
         "logPath": str(session / "bridge.jsonl"),
@@ -148,15 +150,52 @@ def main() -> int:
     elapsed = time.time() - started
     supervisor.terminate()
     supervisor.wait(timeout=10)
-    # Final truth absorption from the standalone controller (post-hoc proof).
+
+    # Post-hoc audit under the SAME session id the supervisor used: reconcile
+    # must reach the launched jobs, and the assertions below decide success.
     from agent_exec.jobs import JobController
     auditor = JobController(PROOF / "supervisor-store.sqlite",
                             evidence_root=PROOF / "evidence",
-                            session_id="qfn-validation-audit")
+                            session_id="qfn-validation")
+    failures: list[str] = []
+    jobs: list[dict] = []
     try:
-        audit = auditor.reconcile_all()
+        auditor.reconcile_all()
+        import sqlite3
+        db = sqlite3.connect(PROOF / "supervisor-store.sqlite")
+        db.row_factory = sqlite3.Row
+        jobs = [dict(r) for r in db.execute(
+            "SELECT job_id, state, outcome, cleanup FROM jobs")]
+        db.close()
+        if not jobs:
+            failures.append("no jobs launched")
+        for job in jobs:
+            if job["state"] != "completed":
+                failures.append(f"job {job['job_id']} not terminal: {job['state']}")
+            if job["outcome"] != "passed":
+                failures.append(f"job {job['job_id']} outcome={job['outcome']}")
+            if job["cleanup"] != "verified_empty":
+                failures.append(f"job {job['job_id']} cleanup={job['cleanup']}")
+        # The model must have reported the receipt of its own job.
+        texts = []
+        for log_line in (session / "opencode.log").read_text().splitlines():
+            try:
+                event = json.loads(log_line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "text":
+                texts.append(event["part"]["text"])
+        final_text = texts[-1] if texts else ""
+        for job in jobs:
+            if job["job_id"] not in final_text:
+                failures.append(f"model report missing job id {job['job_id']}")
+        if "passed" not in final_text.lower():
+            failures.append("model report lacks 'passed'")
+        if rc != 0:
+            failures.append(f"opencode exit={rc}")
     finally:
         auditor.close()
+
     receipt = {
         "schema_version": 1,
         "validation": "ck3-real-harness-opencode-qfn",
@@ -164,12 +203,14 @@ def main() -> int:
         "opencode_exit": rc,
         "elapsed_seconds": round(elapsed, 2),
         "supervisor_operations": sorted(operations),
-        "audit_reconciliation": audit,
+        "jobs": jobs,
+        "failures": failures,
+        "passed": not failures,
         "notes": ["relay keeps the API key on XTX; one client, one bounded session"],
     }
     (PROOF / "validation-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt, indent=2))
-    return 0
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":

@@ -24,8 +24,10 @@ function isTransientStatus(status) {
 }
 
 export class BridgeCore {
-  constructor({ supervisorUrl, log = () => {}, options = {}, fetchImpl = fetch }) {
+  constructor({ supervisorUrl, token = null, log = () => {}, options = {},
+                fetchImpl = fetch }) {
     this.supervisorUrl = supervisorUrl.replace(/\/$/, "");
+    this.token = token;
     this.log = log;
     this.options = { ...DEFAULTS, ...options };
     this.fetchImpl = fetchImpl.bind(globalThis);
@@ -40,7 +42,8 @@ export class BridgeCore {
     this.polls += 1;
     const res = await this.fetchImpl(
       `${this.supervisorUrl}/events?cursor=${this.cursor}`,
-      { signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
+      { headers: this.token ? { "X-Agent-Exec-Token": this.token } : {},
+        signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
     if (!res.ok) throw new Error(`supervisor_http_${res.status}`);
     const data = await res.json();
     const previous = this.cursor;
@@ -114,6 +117,7 @@ export class BridgeCore {
       }
       try {
         const res = await this.fetchImpl(`${this.supervisorUrl}/jobs`, {
+          headers: this.token ? { "X-Agent-Exec-Token": this.token } : {},
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ operation, request_id: requestId,
@@ -140,8 +144,9 @@ export class BridgeCore {
   }
 
   async fetchJob(jobId) {
-    const res = await this.fetchImpl(`${this.supervisorUrl}/jobs/${jobId}`,
-      { signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
+    const res = await this.fetchImpl(`${this.supervisorUrl}/jobs/${jobId}`, {
+      headers: { ...(this.token ? { "X-Agent-Exec-Token": this.token } : {}) },
+      signal: AbortSignal.timeout(this.options.pollTimeoutMs) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`job_fetch_failed_${res.status}`);
     return data;

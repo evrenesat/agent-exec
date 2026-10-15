@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import secrets
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,11 +32,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from agent_exec.jobs import JobController, JobError  # noqa: E402
 
 
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+MAX_DEADLINE_SECONDS = 3600
+
+
 class Supervisor:
-    def __init__(self, controller: JobController, operations: dict | None = None):
+    def __init__(self, controller: JobController, operations: dict | None = None,
+                 *, token: str | None = None, max_deadline_seconds: int = MAX_DEADLINE_SECONDS):
         self.controller = controller
         self.operations = operations or {}
+        self.token = token
+        self.max_deadline_seconds = max_deadline_seconds
         self.launch_count = 0
+
+    def validate_request_id(self, request_id: str) -> str:
+        """Restrictive id policy: it becomes part of a filesystem path."""
+        if not isinstance(request_id, str) or not REQUEST_ID_PATTERN.fullmatch(request_id):
+            raise JobError("invalid request_id: must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+        return request_id
+
+    def job_dir_for(self, session_id: str, request_id: str) -> Path:
+        """Job directory under the evidence root; refuses any escape."""
+        job_dir = (self.controller.evidence_root / "jobs" /
+                   f"{session_id}-{request_id}")
+        resolved = job_dir.resolve()
+        evidence_resolved = Path(self.controller.evidence_root).resolve()
+        if evidence_resolved != resolved and evidence_resolved not in resolved.parents:
+            raise JobError("job path escapes the evidence root")
+        return job_dir
 
     def events_payload(self, cursor: int) -> dict:
         """Absorb live terminal truth first, then serve events after cursor.
@@ -73,26 +98,38 @@ class Supervisor:
         return {"events": events, "cursor": max_seq}
 
     def launch(self, body: dict) -> dict:
-        request_id = body.get("request_id")
-        if not request_id:
-            raise JobError("request_id is required")
+        if not isinstance(body, dict):
+            raise JobError("body must be a JSON object")
+        if "env" in body:
+            # Callers cannot alter the execution environment: the operation
+            # definition owns it (review P0#2).
+            raise JobError("caller-supplied environment overrides are rejected")
+        request_id = self.validate_request_id(body.get("request_id"))
         operation = body.get("operation")
         if operation and operation in self.operations:
             spec = self.operations[operation]
             cwd = spec.get("cwd")
-            env_overrides = spec.get("env", {})
+            env = dict(spec.get("env", {}))
         else:
             raise JobError(f"unknown operation: {operation!r}; "
                            f"known: {sorted(self.operations)}")
-        deadline = int(body.get("deadline_seconds") or spec.get("deadline_seconds", 120))
+        # Deadlines come from the admitted operation definition; a caller may
+        # only shorten within it, never exceed the server-side maximum.
+        requested = body.get("deadline_seconds")
+        deadline = int(spec.get("deadline_seconds", 120))
+        if requested is not None:
+            deadline = min(deadline, int(requested))
+        deadline = min(deadline, self.max_deadline_seconds)
+        if deadline <= 0:
+            raise JobError("deadline must be positive")
         # Per-job report dir: "{report_dir}" tokens in the operation argv are
         # replaced with a job-owned path so concurrent jobs never share files.
-        report_dir = self.controller.evidence_root / "jobs" / \
-            f"{self.controller.session_id}-{request_id}" / "reports"
+        # Defense in depth beyond the request_id regex: the resolved path must
+        # stay inside the evidence root.
+        report_dir = self.job_dir_for(self.controller.session_id,
+                                      request_id) / "reports"
         report_dir.mkdir(parents=True, exist_ok=True)
         argv = [part.replace("{report_dir}", str(report_dir)) for part in spec["argv"]]
-        env = dict(env_overrides)
-        env.update({str(k): str(v) for k, v in (body.get("env") or {}).items()})
         result = self.controller.launch(
             argv, request_id=str(request_id), operation_id=operation,
             deadline_seconds=deadline, stop_grace_seconds=5, env=env,
@@ -113,7 +150,15 @@ def make_handler(supervisor: Supervisor):
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorized(self) -> bool:
+            if supervisor.token is None:
+                return True
+            return self.headers.get("X-Agent-Exec-Token") == supervisor.token
+
         def do_GET(self):
+            if not self._authorized():
+                self._json(401, {"error": "unauthorized"})
+                return
             if self.path.startswith("/health"):
                 self._json(200, {"ready": True, "supervisor": "execution-layer"})
             elif self.path.startswith("/events"):
@@ -141,6 +186,9 @@ def make_handler(supervisor: Supervisor):
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._authorized():
+                self._json(401, {"error": "unauthorized"})
+                return
             if not self.path.startswith("/jobs"):
                 self._json(404, {"error": "not found"})
                 return
@@ -170,11 +218,15 @@ def main() -> int:
         operations = json.loads(args.operations.read_text())
     controller = JobController(Path(args.store), evidence_root=Path(args.evidence_root),
                                session_id=args.session_label)
-    supervisor = Supervisor(controller, operations)
+    token = secrets.token_hex(16)
+    supervisor = Supervisor(controller, operations, token=token)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(supervisor))
     port = server.server_port
+    # The token is emitted once, locally, for the session driver to hand to
+    # the bridge config; loopback binding plus token gates other local
+    # processes from launching jobs.
     print(json.dumps({"listening": f"http://127.0.0.1:{port}",
-                      "operations": sorted(operations)}), flush=True)
+                      "operations": sorted(operations), "token": token}), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

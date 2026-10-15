@@ -19,7 +19,7 @@ export default async function ExecBridge() {
     } catch { /* bounded best-effort log */ }
   };
   const core = new BridgeCore({
-    supervisorUrl: config.supervisorUrl, log,
+    supervisorUrl: config.supervisorUrl, token: config.token ?? null, log,
     options: { pollIntervalMs: config.pollIntervalMs ?? 250,
       pollTimeoutMs: config.pollTimeoutMs ?? 3000 },
   });
