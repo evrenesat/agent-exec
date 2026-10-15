@@ -12,7 +12,6 @@ import time
 import uuid
 from pathlib import Path
 
-import uuid
 
 from . import linux_jobs
 from .jobs import JobController, JobError

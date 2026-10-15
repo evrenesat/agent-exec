@@ -96,9 +96,15 @@ def verify_admission(profile: dict, *, scored: bool,
         if not same:
             errors.append("recorded admission argv differs from the current "
                           "profile render; re-admission required")
-    # Receipts with neither profile_sha256 nor recorded argv cannot prove
-    # identity across profile edits; that is a documented verification gap
-    # for pre-binding receipts only. New admissions always record the sha.
+    # Receipts with neither profile_sha256 nor recorded argv+source_root
+    # cannot prove identity across profile edits: reject them for scored
+    # operations (the docs guarantee "changed command => re-admission" would
+    # otherwise be vacuous). Re-admit to obtain a binding receipt.
+    if not recorded_sha and not (runs and runs[0].get("argv")
+                                 and receipt.get("source_root")):
+        errors.append("admission receipt carries no identity binding "
+                      "(profile_sha256 or recorded argv+source_root); "
+                      "re-admission required for scored operations")
     return errors
 
 

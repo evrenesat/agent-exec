@@ -497,10 +497,6 @@ class RealNativeTest(unittest.TestCase):
                 controller.close()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LogPaginationTests(unittest.TestCase):
     """P1#8: bounded reads must not silently skip entries (cursor advances
     only past accepted entries). Uses the real read_logs against a fake
@@ -558,4 +554,5 @@ class LogPaginationTests(unittest.TestCase):
                          ["c1", "c2", "c3"])
         self.assertTrue(any("oversized" in e["message"] for e in result["entries"]))
 
-
+if __name__ == "__main__":
+    unittest.main()

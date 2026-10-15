@@ -160,3 +160,78 @@ class ConcurrentMalformedRequestsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HttpRoundTripTests(unittest.TestCase):
+    """Real HTTP round trips (the reviewer's gap: predicate-only tests missed
+    the Pi launch 401 and the dropped-connection failures)."""
+
+    def setUp(self):
+        import tempfile
+        import threading
+        from http.client import HTTPConnection
+        self.http = HTTPConnection
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "ev",
+                                        session_id="sess", backend=self.backend)
+        self.supervisor = Supervisor(self.controller, {
+            "demo.op": {"argv": ["/bin/true"], "deadline_seconds": 60},
+        }, token="tok-123")
+        from agent_exec.harness.opencode.supervisor import make_handler
+        from http.server import ThreadingHTTPServer
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                          make_handler(self.supervisor))
+        self.port = self.server.server_port
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def request(self, method, path, body=None, token="tok-123"):
+        import json as jsonlib
+        conn = self.http("127.0.0.1", self.port, timeout=10)
+        headers = {"X-Agent-Exec-Token": token} if token else {}
+        payload = None
+        if body is not None:
+            payload = jsonlib.dumps(body)
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=payload, headers=headers)
+        response = conn.getresponse()
+        data = jsonlib.loads(response.read() or b"{}")
+        conn.close()
+        return response.status, data
+
+    def test_wrong_token_is_401_on_get_and_post(self):
+        status, _ = self.request("GET", "/health", token="wrong")
+        self.assertEqual(status, 401)
+        status, _ = self.request("POST", "/jobs",
+                                 {"operation": "demo.op", "request_id": "x1"},
+                                 token=None)
+        self.assertEqual(status, 401)
+
+    def test_correct_token_launches_and_reads(self):
+        status, body = self.request("POST", "/jobs",
+                                    {"operation": "demo.op", "request_id": "ok"})
+        self.assertEqual(status, 200)
+        status, _ = self.request("GET", "/health")
+        self.assertEqual(status, 200)
+
+    def test_bad_cursor_returns_400_not_dropped_connection(self):
+        status, body = self.request("GET", "/events?cursor=abc")
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    def test_bad_deadline_type_returns_400(self):
+        status, body = self.request("POST", "/jobs",
+                                    {"operation": "demo.op", "request_id": "bd",
+                                     "deadline_seconds": "abc"})
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)

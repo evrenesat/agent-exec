@@ -86,10 +86,13 @@ Supervisor (HTTP, loopback, per-session token on every route, operations-
 allowlist) over the controller; request ids are strictly validated and become
 contained filesystem paths; callers cannot alter environments or exceed
 operation deadlines; scored operations must bind an admitted profile whose
-receipt is verified (identity sha or normalized argv). Plugins poll `/events`
+receipt is verified and carries an identity binding (profile sha256, or the
+recorded admission argv plus source root — identity-less receipts are
+rejected for scored work). Plugins poll `/events`
 with a cursor; the supervisor reconciles live jobs before serving, making
 polling self-driving. Waits are job-specific — a terminal event settles only
-its own job's wait, and an expired wait is an explicit inconclusive. Bounded
+its own job's wait (the generic drain is marked `unfiltered_drain` and may
+carry other jobs' events), and an expired wait is an explicit inconclusive. Bounded
 waits absorb in one model turn — measured: an 86-poll wait replaced what would
 have been model-turn polling.
 

@@ -93,6 +93,9 @@ export class BridgeCore {
     }
     return {
       job_id: jobId,
+      // Generic drains (jobId null) may report OTHER jobs' events: consumers
+      // must check job_id before attributing any event to their own work.
+      unfiltered_drain: jobId === null,
       events: collected.map((e) => ({ job_id: e.job_id, revision: e.revision,
         status: e.status, terminal: e.terminal === true, outcome: e.outcome,
         cleanup: e.cleanup })),
@@ -117,9 +120,9 @@ export class BridgeCore {
       }
       try {
         const res = await this.fetchImpl(`${this.supervisorUrl}/jobs`, {
-          headers: this.token ? { "X-Agent-Exec-Token": this.token } : {},
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { ...(this.token ? { "X-Agent-Exec-Token": this.token } : {}),
+            "Content-Type": "application/json" },
           body: JSON.stringify({ operation, request_id: requestId,
             deadline_seconds: deadlineSeconds }),
           signal: AbortSignal.timeout(this.options.pollTimeoutMs),

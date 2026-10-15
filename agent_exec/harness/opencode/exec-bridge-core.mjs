@@ -79,6 +79,9 @@ export class BridgeCore {
     }
     return {
       job_id: jobId,
+      // Generic drains (jobId null) may report OTHER jobs' events: consumers
+      // must check job_id before attributing any event to their own work.
+      unfiltered_drain: jobId === null,
       events: collected.map((e) => ({ job_id: e.job_id, revision: e.revision,
         status: e.status, terminal: e.terminal === true, outcome: e.outcome,
         cleanup: e.cleanup })),

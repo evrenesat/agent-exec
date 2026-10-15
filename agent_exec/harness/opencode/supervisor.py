@@ -27,10 +27,20 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+def _package_root() -> str:
+    """Repo root that makes `import agent_exec` work in ANY execution mode
+    (python -m, direct script, or copied location)."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "agent_exec" / "__init__.py").is_file():
+            return str(parent)
+    return str(here.parents[3] if len(here.parents) > 3 else here.parents[0])
 
-from agent_exec.contracts import render
-from agent_exec.jobs import JobController, JobError  # noqa: E402
+
+sys.path.insert(0, _package_root())
+
+from agent_exec.contracts import render  # noqa: E402
+from agent_exec.jobs import JobController, JobError  # noqa: E402  # noqa: E402
 
 
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -207,6 +217,16 @@ def make_handler(supervisor: Supervisor):
             return self.headers.get("X-Agent-Exec-Token") == supervisor.token
 
         def do_GET(self):
+            try:
+                self._do_get()
+            except JobError as error:
+                self._json(400, {"error": str(error)})
+            except (ValueError, KeyError) as error:
+                self._json(400, {"error": f"{type(error).__name__}: {error}"})
+            except Exception as error:  # noqa: BLE001 — never drop the socket
+                self._json(500, {"error": f"{type(error).__name__}: {error}"})
+
+        def _do_get(self):
             if not self._authorized():
                 self._json(401, {"error": "unauthorized"})
                 return
@@ -237,18 +257,23 @@ def make_handler(supervisor: Supervisor):
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
-            if not self._authorized():
-                self._json(401, {"error": "unauthorized"})
-                return
-            if not self.path.startswith("/jobs"):
-                self._json(404, {"error": "not found"})
-                return
-            length = int(self.headers.get("Content-Length", 0))
             try:
+                if not self._authorized():
+                    self._json(401, {"error": "unauthorized"})
+                    return
+                if not self.path.startswith("/jobs"):
+                    self._json(404, {"error": "not found"})
+                    return
+                length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    self._json(400, {"error": "body must be a JSON object"})
+                    return
                 self._json(200, supervisor.launch(body))
             except JobError as error:
                 self._json(400, {"error": str(error)})
+            except (ValueError, KeyError, json.JSONDecodeError) as error:
+                self._json(400, {"error": f"{type(error).__name__}: {error}"})
             except Exception as error:  # noqa: BLE001 — surface honestly
                 self._json(500, {"error": f"{type(error).__name__}: {error}"})
 

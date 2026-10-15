@@ -33,7 +33,7 @@ HTTP contract:
 | `GET /jobs/<id>` | current receipt (+ parsed vitest report when present) |
 | `GET /events?cursor=<seq>` | wake-capable events after cursor; **reconciles live jobs first**, so polling is self-driving |
 
-Events are deduplicated by `(job_id, revision)` on both sides; unchanged status never wakes a waiter; a transient 503 is retried; an elapsed wait is reported as such and cancels nothing.
+Events are deduplicated by `(job_id, revision)` on both sides; unchanged status never wakes a waiter; a transient 503 is retried; an elapsed wait is reported as such and cancels nothing. Job-attributed waits (`project_run`) settle only on their own job's terminal event; the generic `exec_job_wait` drain is marked `unfiltered_drain: true` and may carry other jobs' events — check `job_id` before attributing anything.
 
 ## OpenCode 1.x
 
@@ -52,10 +52,13 @@ Config (`opencode.json`) essentials:
     "options": { "baseURL": "<your-local-endpoint>/v1", "apiKey": "<placeholder>" } } } }
 ```
 
-`<config-dir>/xtx-exec-bridge.json`:
+`<config-dir>/xtx-exec-bridge.json` — the `token` is mandatory: the
+supervisor prints it once with the listen line and rejects every request
+without it:
 
 ```json
 { "supervisorUrl": "http://127.0.0.1:<port>",
+  "token": "<token-from-supervisor-startup>",
   "pollIntervalMs": 250, "pollTimeoutMs": 3000,
   "logPath": "<session>/bridge.jsonl" }
 ```

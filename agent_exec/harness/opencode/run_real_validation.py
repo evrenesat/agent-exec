@@ -11,10 +11,11 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # repo root
 
 HERE = Path(__file__).resolve().parent          # harness/opencode
 MODULE = HERE.parents[1]                        # agent_exec
@@ -31,14 +32,15 @@ PROMPT = ("Use the project_run tool exactly once to run operation 'aflow.web.uni
           "and cleanup. Do not run any other tools and do not retry.")
 
 
-def wait_health(url: str, timeout: float = 20) -> None:
+def wait_health(url: str, token: str, timeout: float = 20) -> None:
     deadline = time.monotonic() + timeout
+    request = urllib.request.Request(url, headers={"X-Agent-Exec-Token": token})
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=1) as response:
+            with urllib.request.urlopen(request, timeout=1) as response:
                 if response.status == 200:
                     return
-        except OSError:
+        except (OSError, urllib.error.HTTPError):
             time.sleep(0.1)
     raise RuntimeError(f"supervisor not healthy at {url}")
 
@@ -80,7 +82,7 @@ def main() -> int:
     info = json.loads(line)
     supervisor_url = info["listening"]
     token = info["token"]
-    wait_health(supervisor_url + "/health")
+    wait_health(supervisor_url + "/health", token)
 
     for name in ("package.json", "package-lock.json"):
         shutil.copyfile(RUNTIME / name, config_dir / name)

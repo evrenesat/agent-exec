@@ -31,3 +31,25 @@ test("pi core: waiting for B ignores A's completion; B's failure settles", async
   assert.equal(result.terminal.job_id, "B");
   assert.equal(result.terminal.outcome, "failed");
 });
+
+test("pi core: launch carries the auth token (regression: duplicate headers key)", async () => {
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, headers: init.headers });
+    if (url.endsWith("/jobs")) {
+      return jsonResponse(200, { job_id: "jA", replayed: false, state: "running" });
+    }
+    return jsonResponse(200, { events: [
+      { job_id: "jA", revision: 1, status: "passed", outcome: "passed",
+        terminal: true }], cursor: 1 });
+  };
+  const core = new BridgeCore({ supervisorUrl: "http://x", token: "tok-pi",
+    fetchImpl, options: { pollIntervalMs: 5 } });
+  const launch = await core.launchOperation("demo.op", { requestId: "r1" });
+  assert.equal(seen[0].headers["X-Agent-Exec-Token"], "tok-pi",
+    "POST /jobs must carry the token (duplicate headers key regression)");
+  assert.equal(seen[0].headers["Content-Type"], "application/json");
+  const result = await core.pollUntilTerminal({ jobId: launch.job_id,
+    maxWaitMs: 1000 });
+  assert.equal(result.terminal.job_id, "jA");
+});

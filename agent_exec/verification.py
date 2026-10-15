@@ -66,6 +66,9 @@ class VerificationLedger:
             if receipt.get("cleanup") != "verified_empty":
                 raise ValueError("automated pass requires cleanup="
                                  "'verified_empty'")
+            if receipt.get("job_id") not in (None, job_id):
+                raise ValueError("receipt belongs to a different job "
+                                 f"({receipt.get('job_id')} != {job_id})")
         entry = LedgerEntry(
             requirement_id=requirement_id, operation_id=self.requirements[requirement_id].operation_id,
             scope=self.requirements[requirement_id].scope, state=outcome,

@@ -134,6 +134,15 @@ class JobController:
         row = self._require_owned(job_id)
         if row["state"] in TERMINAL_STATES:
             return self._receipt(row)
+        if row["unit"] == "(unlaunched)":
+            # Reserved but launch not confirmed yet: there is no unit to
+            # inspect. Reporting blocked here (not waiting) avoids racing an
+            # in-flight launch into a wrong finalization; reconcile is the
+            # authority for crash recovery of such rows.
+            return {"job_id": job_id, "state": row["state"], "phase": "unlaunched",
+                    "unit": row["unit"],
+                    "note": "launch not confirmed; use reconcile to recover "
+                            "if the launching controller died"}
         spec = self._spec_for(row)
         observation = self.backend.inspect(spec)
         if observation.get("load_state") == "unknown":

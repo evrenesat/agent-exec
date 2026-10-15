@@ -157,3 +157,22 @@ test("terminal event present before waiting settles immediately for that job", a
   assert.equal(result.inconclusive, false);
   assert.equal(result.settled_event.job_id, "B");
 });
+
+// Review round 2: the Pi bridge originally dropped the auth token on POST
+// (duplicate headers key). Lock the launch-auth contract in for both cores.
+test("launch sends the auth token header (regression: duplicate headers key)", async () => {
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    seen.push(init.headers);
+    return jsonResponse(200, { job_id: "j9", replayed: false, state: "running" });
+  };
+  const core = new BridgeCore({ supervisorUrl: "http://x", token: "tok-abc",
+    fetchImpl });
+  await core.launchOperation("demo.op", { requestId: "r1" });
+  assert.equal(seen[0]["X-Agent-Exec-Token"], "tok-abc",
+    "POST /jobs must carry the token");
+  assert.equal(seen[0]["Content-Type"], "application/json");
+  // Poll path too.
+  await core.pollOnce();
+  assert.equal(seen[1]["X-Agent-Exec-Token"], "tok-abc");
+});
