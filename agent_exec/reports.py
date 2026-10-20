@@ -100,6 +100,32 @@ def read_junit_xml(path: Path) -> dict:
             if total == 0 else []}
 
 
+def read_go_test_json(path: Path) -> dict:
+    """Read a captured `go test -json` stream via the go_reports parser."""
+    from .go_reports import parse_go_test_json_stream
+    path = Path(path)
+    if not path.is_file():
+        return {"kind": "go-test-json", "integrity": "missing",
+                "complete": False, "error": "report file absent"}
+    raw = path.read_text()
+    if not raw.strip():
+        return {"kind": "go-test-json", "integrity": "empty",
+                "complete": False, "error": "report file is empty"}
+    parsed = parse_go_test_json_stream(raw)
+    counts = parsed.get("counts", parsed.get("summary", {}))
+    complete = parsed.get("integrity") == "complete" and counts.get("packages_failed", 1) == 0
+    return {"kind": "go-test-json", "integrity": parsed.get("integrity"),
+            "complete": complete, "bytes": len(raw),
+            "tests_passed": counts.get("tests_passed", 0),
+            "tests_failed": counts.get("tests_failed", 0),
+            "tests_skipped": counts.get("tests_skipped", 0),
+            "packages_no_tests": counts.get("packages_no_tests", 0),
+            "packages_cached": counts.get("packages_cached", 0),
+            "failures": parsed.get("failures", [])[:10],
+            "notes": ["no-test packages counted separately, never whole-project "
+                      "success"] if counts.get("packages_no_tests") else []}
+
+
 def summarize(reports: list[dict]) -> dict:
     """Combine report summaries; any incomplete part keeps the check honest."""
     complete = bool(reports) and all(r.get("complete") for r in reports)

@@ -127,5 +127,27 @@ class ReceiptDerivedPassTests(unittest.TestCase):
         self.assertEqual(self.led.manifest()["checks"]["visual"]["state"], "passed")
 
 
+class LedgerOperationBindingTests(unittest.TestCase):
+    """P1-3 round 2: receipts must belong to the requirement's operation."""
+
+    def setUp(self):
+        self.led = ledger()
+
+    def test_foreign_operation_receipt_rejected(self):
+        with self.assertRaises(ValueError):
+            self.led.observe(requirement_id="unit", job_id="j1", outcome="passed",
+                             receipt={"outcome": "passed",
+                                      "cleanup": "verified_empty",
+                                      "operation_id": "other.op"})
+
+    def test_matching_operation_receipt_accepted(self):
+        entry = self.led.observe(requirement_id="unit", job_id="j1",
+                                 outcome="passed",
+                                 receipt={"outcome": "passed",
+                                          "cleanup": "verified_empty",
+                                          "operation_id": "aflow.web.unit"})
+        self.assertEqual(entry.state, "passed")
+
+
 if __name__ == "__main__":
     unittest.main()

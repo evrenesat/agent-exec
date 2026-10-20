@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -472,6 +473,58 @@ class RealNativeTest(unittest.TestCase):
                 self.assertEqual(receipt["cleanup"], "verified_empty")
             finally:
                 second.close()
+
+    def test_descendant_cgroup_population_blocks_cleanup_verification(self):
+        """Regression (review P1-1): a unit whose own cgroup.procs is EMPTY
+        but whose CHILD cgroup holds a process must NOT be verified_empty.
+        The old cgroup.procs-only check passed exactly this case."""
+        import shutil
+        import subprocess as sp
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            controller = JobController(root / "s.sqlite", evidence_root=root / "ev",
+                                       session_id="native-cgroup")
+            try:
+                started = controller.launch(["/bin/sleep", "60"],
+                                            request_id="cg", operation_id="native",
+                                            deadline_seconds=120,
+                                            stop_grace_seconds=30)
+                job_id = started["job_id"]
+                unit = linux_jobs.unit_name(job_id)
+                unit_cgroup = Path("/sys/fs/cgroup/system.slice", unit)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if unit_cgroup.exists():
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(unit_cgroup.exists(), "unit cgroup never appeared")
+                # Active job => populated => failed, sanity.
+                self.assertEqual(linux_jobs.cgroup_state(unit), "failed")
+                # Reproduce the bug shape: move the MAIN process into a child
+                # cgroup so the unit's own cgroup.procs becomes empty while a
+                # descendant stays populated.
+                main_pid = (unit_cgroup / "cgroup.procs").read_text().split()[0]
+                child = unit_cgroup / "child"
+                child.mkdir(exist_ok=True)
+                (child / "cgroup.procs").write_text(main_pid)
+                self.assertEqual((unit_cgroup / "cgroup.procs").read_text().split(),
+                                 [], "precondition: unit-level procs now empty")
+                # THE regression assertion: cgroup.events must see the child.
+                self.assertEqual(linux_jobs.cgroup_state(unit), "failed",
+                                 "populated descendant must fail verified_empty")
+                # Stop the unit: systemd's control-group sweep must remove the
+                # child too, after which cleanup verifies empty.
+                controller.cancel(job_id, reason="test teardown")
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if linux_jobs.cgroup_state(unit) == "verified_empty":
+                        break
+                    time.sleep(0.2)
+                self.assertEqual(linux_jobs.cgroup_state(unit), "verified_empty")
+                shutil.rmtree(child, ignore_errors=True)
+            finally:
+                controller.close()
 
     def test_missing_exit_record_finalizes_inconclusive_on_real_units(self):
         import tempfile

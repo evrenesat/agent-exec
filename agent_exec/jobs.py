@@ -334,6 +334,10 @@ class JobController:
                 if observation["phase"] == "terminal":
                     receipt = self._absorb_terminal(job_id, current, spec, observation)
                     return {"elapsed": False, "event": None, "receipt": receipt}
+                if (observation.get("phase") == "inconclusive"
+                        and observation.get("ended")):
+                    receipt = self._finalize_inconclusive(job_id, observation)
+                    return {"elapsed": False, "event": None, "receipt": receipt}
                 self.store.record_event(job_id, "status", {"phase": observation["phase"]})
             if time.monotonic() >= deadline:
                 return {"elapsed": True, "event": None, "receipt": None,

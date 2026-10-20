@@ -39,7 +39,15 @@ class LedgerEntry:
 
 
 class VerificationLedger:
-    """Track required checks and their freshest valid receipts."""
+    """Track required checks and their freshest valid receipts.
+
+    Callers MUST pass receipts obtained from JobController.status()/wait()
+    (the trusted store); the ledger validates internal consistency — job id,
+    operation id, outcome, cleanup — and refuses fabricated or borrowed
+    receipt bodies for automated passes. It does not itself read the store;
+    drivers that need store-level verification should reconcile + fetch the
+    receipt through the controller before observing.
+    """
 
     def __init__(self, requirements: list[Requirement]):
         self.requirements = {r.requirement_id: r for r in requirements}
@@ -69,6 +77,11 @@ class VerificationLedger:
             if receipt.get("job_id") not in (None, job_id):
                 raise ValueError("receipt belongs to a different job "
                                  f"({receipt.get('job_id')} != {job_id})")
+            expected_operation = requirement.operation_id
+            if receipt.get("operation_id") not in (None, expected_operation):
+                raise ValueError("receipt belongs to a different operation "
+                                 f"({receipt.get('operation_id')} != "
+                                 f"{expected_operation})")
         entry = LedgerEntry(
             requirement_id=requirement_id, operation_id=self.requirements[requirement_id].operation_id,
             scope=self.requirements[requirement_id].scope, state=outcome,

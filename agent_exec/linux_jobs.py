@@ -128,11 +128,28 @@ def launch(spec: JobSpec) -> dict:
 
 
 def cgroup_state(unit: str) -> str:
-    """verified_empty | failed | unknown for the unit's cleanup evidence."""
+    """verified_empty | failed | unknown for the unit's cleanup evidence.
+
+    Uses cgroup.events `populated`, which includes descendant cgroups: an
+    empty unit cgroup.procs with a populated child is NOT clean (a process
+    can hide in a nested cgroup). Unreadable evidence is unknown, never a
+    quiet pass.
+    """
     cgroup = CGROUP_ROOT / unit
     try:
         if not cgroup.exists():
             return "verified_empty"
+        events = (cgroup / "cgroup.events").read_text().split()
+        populated = None
+        for index, token in enumerate(events):
+            if token == "populated" and index + 1 < len(events):
+                populated = events[index + 1]
+                break
+        if populated is None:
+            return "unknown"
+        if populated != "0":
+            return "failed"
+        # Belt and braces: populated 0 with stray direct procs is still dirty.
         procs = (cgroup / "cgroup.procs").read_text().split()
         return "failed" if procs else "verified_empty"
     except OSError:
