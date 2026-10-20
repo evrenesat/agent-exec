@@ -281,7 +281,7 @@ class VerificationLedger:
             "checks": checks,
             "note": "complete=False is expected until every required check has a "
                     "fresh passing receipt; an automated check counts toward "
-                    "complete only when observed_from_store() fetched its "
+                    "complete only when observe_from_store() fetched its "
                     "receipt (observed_via='store') — a caller-supplied pass "
                     "stays visible with its state and provenance but does not "
                     "complete; a complete manifest still requires "
