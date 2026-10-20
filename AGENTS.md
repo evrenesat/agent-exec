@@ -57,4 +57,4 @@ python3 -m agent_exec.profiles --check agent_exec/profiles
 node --test agent_exec/harness/tests/*.test.mjs            # if bridges touched
 ```
 
-A delivery is complete only when every required check in the verification ledger has a fresh passing receipt — and even then, independent review still applies.
+Prefer `ledger.observe_from_store(controller, requirement_id=..., job_id=...)`: it pulls the receipt from the trusted store (no caller-supplied body can certify a pass); non-pass terminal receipts map to `failed` with the true outcome retained in the manifest. A delivery is complete only when every required check in the verification ledger has a fresh passing receipt — and even then, independent review still applies.

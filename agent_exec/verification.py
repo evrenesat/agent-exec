@@ -45,8 +45,9 @@ class VerificationLedger:
     (the trusted store); the ledger validates internal consistency — job id,
     operation id, outcome, cleanup — and refuses fabricated or borrowed
     receipt bodies for automated passes. It does not itself read the store;
-    drivers that need store-level verification should reconcile + fetch the
-    receipt through the controller before observing.
+    observe_from_store() is the stronger binding: it fetches the CURRENT
+    receipt through the controller itself, so no caller-supplied receipt
+    body can ever certify an automated pass.
     """
 
     def __init__(self, requirements: list[Requirement]):
@@ -90,6 +91,69 @@ class VerificationLedger:
             updated_wall=wall if wall is not None else time.time())
         self.entries[requirement_id] = entry
         return entry
+
+    def observe_from_store(self, controller, *, requirement_id: str, job_id: str,
+                           input_fingerprint: str | None = None) -> LedgerEntry:
+        """Observe a required check from the receipt in the trusted store.
+
+        Fetches the CURRENT receipt for ``job_id`` through
+        ``controller.status(job_id)`` (an agent_exec.jobs.JobController, or
+        any duck-typed stand-in) and maps it to a ledger state. This method
+        takes no receipt/outcome argument, so a fabricated receipt body can
+        never certify a pass — only what the controller returns is trusted.
+
+        Receipt -> state mapping (documented decision):
+        - no terminal ``outcome`` field (running/unlaunched/unknown status
+          payload) -> ``running``;
+        - ``outcome='passed'`` AND ``cleanup='verified_empty'`` ->
+          ``passed`` (same standard as observe());
+        - every other terminal outcome — ``failed``, ``timed_out``,
+          ``cancelled``, ``blocked``, ``inconclusive``, or a claimed pass
+          without verified-empty cleanup — maps to ``failed``. The ledger
+          has no inconclusive state, and a required automated check that
+          cannot prove a pass has failed to pass; the full receipt is
+          retained on the entry, so the manifest's ``receipt_outcome``
+          still shows the nuance (e.g. ``inconclusive``).
+
+        Errors: a controller lookup failure (unknown job ``KeyError``,
+        cross-session/ownership ``JobError``/``JobAccessError``, i.e. any
+        ``RuntimeError`` subclass the controller raises) is re-raised as
+        ``ValueError`` with the original exception chained, so callers can
+        catch one type for store-access problems. A receipt whose
+        ``job_id`` or ``operation_id`` does not match the requested
+        job/requirement raises ``ValueError``. Any other controller error
+        propagates unchanged.
+        """
+        if requirement_id not in self.requirements:
+            raise KeyError(f"unknown requirement: {requirement_id!r}")
+        try:
+            receipt = controller.status(job_id)
+        except KeyError as exc:
+            raise ValueError(f"job {job_id!r} is unknown to the "
+                             f"controller: {exc}") from exc
+        except RuntimeError as exc:
+            raise ValueError(f"job {job_id!r} cannot be observed through "
+                             f"this controller: {exc}") from exc
+        receipt = dict(receipt or {})
+        if receipt.get("job_id") != job_id:
+            raise ValueError(f"store receipt is for a different job "
+                             f"({receipt.get('job_id')!r} != {job_id!r})")
+        requirement = self.requirements[requirement_id]
+        if receipt.get("operation_id") != requirement.operation_id:
+            raise ValueError("store receipt belongs to a different "
+                             f"operation ({receipt.get('operation_id')!r} "
+                             f"!= {requirement.operation_id!r})")
+        outcome = receipt.get("outcome")
+        if outcome is None:
+            state = "running"  # status payload, not a terminal receipt
+        elif outcome == "passed" \
+                and receipt.get("cleanup") == "verified_empty":
+            state = "passed"
+        else:
+            state = "failed"
+        return self.observe(requirement_id=requirement_id, job_id=job_id,
+                            outcome=state, receipt=receipt,
+                            input_fingerprint=input_fingerprint)
 
     def invalidate_stale(self, current_fingerprint: str | None) -> list[str]:
         """Mark passed receipts stale when the relevant inputs changed.

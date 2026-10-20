@@ -48,7 +48,7 @@ python3 -m agent_exec.cli selftest --backend linux --output /tmp/exec-selftest
 - CLI sessions persist across invocations (`--session-id`, env, or `~/.agent-exec/session-id`), so launch → status → wait → cancel work from separate shells.
 - The supervisor requires a per-session token on every route; request ids are strictly validated; callers cannot alter the environment, and scored operations must bind an admitted profile whose receipt is verified (changed command ⇒ re-admission required).
 - An agent's `project_run` result is always attributed to its own job — concurrent completions from other jobs can never be mistaken for yours, and an expired wait is an explicit `inconclusive`.
-- Reports with zero collected tests are incomplete evidence, never success; ledger passes derive from real job receipts.
+- Reports with zero collected tests are incomplete evidence, never success; ledger passes derive from real job receipts — `observe_from_store()` fetches the receipt from the job controller itself, so no caller-typed status string or fabricated receipt can certify a check.
 - Cancellation stops exactly that unit; no process-name kills, ever.
 - Coalescing / result-reuse / "this looks like a loop" enforcement are **off** by default; the recovery policy ships in observe-only mode with a zero-false-block test gate before any enforcement.
 

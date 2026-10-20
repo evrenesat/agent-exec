@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -147,6 +148,146 @@ class LedgerOperationBindingTests(unittest.TestCase):
                                           "cleanup": "verified_empty",
                                           "operation_id": "aflow.web.unit"})
         self.assertEqual(entry.state, "passed")
+
+
+class LedgerStoreBindingTests(unittest.TestCase):
+    """P1-3: required checks observed from the trusted store only."""
+
+    def store_ledger(self) -> VerificationLedger:
+        return VerificationLedger(
+            [Requirement("unit", "aflow.web.unit", scope="full")])
+
+    def store_receipt(self, job_id="j1", operation_id="aflow.web.unit",
+                      **overrides):
+        receipt = {"job_id": job_id, "operation_id": operation_id,
+                   "outcome": "passed", "cleanup": "verified_empty"}
+        receipt.update(overrides)
+        return receipt
+
+    def test_passed_store_receipt_completes_manifest(self):
+        controller = FakeStoreController({"j1": self.store_receipt()})
+        led = self.store_ledger()
+        entry = led.observe_from_store(controller, requirement_id="unit",
+                                       job_id="j1")
+        self.assertEqual(entry.state, "passed")
+        self.assertEqual(entry.job_id, "j1")
+        self.assertEqual(controller.requested, ["j1"])
+        self.assertTrue(led.manifest()["complete"])
+
+    def test_running_store_status_maps_to_running(self):
+        controller = FakeStoreController({
+            "j1": {"job_id": "j1", "operation_id": "aflow.web.unit",
+                   "state": "running", "phase": "running", "unit": "u1"}})
+        led = self.store_ledger()
+        entry = led.observe_from_store(controller, requirement_id="unit",
+                                       job_id="j1")
+        self.assertEqual(entry.state, "running")
+        manifest = led.manifest()
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(manifest["checks"]["unit"]["state"], "running")
+
+    def test_inconclusive_receipt_maps_to_failed_with_visible_outcome(self):
+        controller = FakeStoreController({
+            "j1": self.store_receipt(outcome="inconclusive",
+                                     cleanup="unknown",
+                                     inconclusive_reason="exit evidence "
+                                                         "missing")})
+        led = self.store_ledger()
+        entry = led.observe_from_store(controller, requirement_id="unit",
+                                       job_id="j1")
+        self.assertEqual(entry.state, "failed")
+        manifest = led.manifest()
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(manifest["checks"]["unit"]["receipt_outcome"],
+                         "inconclusive")
+        self.assertEqual(entry.receipt["inconclusive_reason"],
+                         "exit evidence missing")
+
+    def test_all_non_pass_terminals_map_to_failed(self):
+        outcomes = [("failed", "failed_exit"), ("timed_out", "deadline"),
+                    ("cancelled", "cancel_requested"),
+                    ("blocked", "unlaunched"),
+                    ("passed", "cleanup_unknown")]
+        for outcome, cleanup in outcomes:
+            with self.subTest(outcome=outcome, cleanup=cleanup):
+                controller = FakeStoreController({
+                    "j1": self.store_receipt(outcome=outcome,
+                                             cleanup=cleanup)})
+                led = self.store_ledger()
+                entry = led.observe_from_store(controller,
+                                               requirement_id="unit",
+                                               job_id="j1")
+                self.assertEqual(entry.state, "failed")
+                self.assertFalse(led.manifest()["complete"])
+
+    def test_operation_mismatch_rejected(self):
+        controller = FakeStoreController({
+            "j1": self.store_receipt(operation_id="other.op")})
+        with self.assertRaises(ValueError):
+            self.store_ledger().observe_from_store(
+                controller, requirement_id="unit", job_id="j1")
+
+    def test_receipt_job_identity_mismatch_rejected(self):
+        controller = FakeStoreController({
+            "j1": self.store_receipt(job_id="other-job")})
+        with self.assertRaises(ValueError):
+            self.store_ledger().observe_from_store(
+                controller, requirement_id="unit", job_id="j1")
+
+    def test_unknown_job_raises_controller_error(self):
+        controller = FakeStoreController({})
+        with self.assertRaises((ValueError, KeyError)):
+            self.store_ledger().observe_from_store(
+                controller, requirement_id="unit", job_id="ghost")
+
+    def test_cross_session_error_becomes_value_error(self):
+        controller = CrossSessionController({})
+        with self.assertRaises(ValueError):
+            self.store_ledger().observe_from_store(
+                controller, requirement_id="unit", job_id="j1")
+
+    def test_no_receipt_parameter_cannot_be_bypassed(self):
+        signature = inspect.signature(VerificationLedger.observe_from_store)
+        self.assertNotIn("receipt", signature.parameters)
+        self.assertNotIn("outcome", signature.parameters)
+        with self.assertRaises(TypeError):
+            self.store_ledger().observe_from_store(
+                FakeStoreController({"j1": self.store_receipt()}),
+                requirement_id="unit", job_id="j1",
+                receipt={"outcome": "passed",
+                         "cleanup": "verified_empty"})
+
+    def test_observe_remains_independent_of_store_binding(self):
+        # The existing observe() path is unchanged: manual declarations and
+        # caller-provided receipts still work exactly as before.
+        led = self.store_ledger()
+        entry = led.observe(requirement_id="unit", job_id="j2",
+                            outcome="passed",
+                            receipt={"outcome": "passed",
+                                     "cleanup": "verified_empty"})
+        self.assertEqual(entry.state, "passed")
+        self.assertTrue(led.manifest()["complete"])
+
+
+class FakeStoreController:
+    """Minimal duck-typed JobController for store-binding tests."""
+
+    def __init__(self, receipts: dict):
+        self.receipts = receipts
+        self.requested: list[str] = []
+
+    def status(self, job_id: str) -> dict:
+        self.requested.append(job_id)
+        if job_id not in self.receipts:
+            raise KeyError(f"unknown job: {job_id}")
+        return dict(self.receipts[job_id])
+
+
+class CrossSessionController(FakeStoreController):
+    """Stands in for the real JobAccessError path (a RuntimeError)."""
+
+    def status(self, job_id: str) -> dict:
+        raise RuntimeError("job belongs to a different session")
 
 
 if __name__ == "__main__":
