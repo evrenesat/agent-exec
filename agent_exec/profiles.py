@@ -27,6 +27,28 @@ def _normalize_argv(argv) -> list[str]:
     return [REPORT_DIR_PATTERN.sub("/REPORTS/", str(part)) for part in argv]
 
 
+ADMISSION_IDENTITY_FIELDS = (
+    # Execution-relevant fields only: administrative fields (status,
+    # admission_receipt, notes) may change during the documented
+    # draft -> fixture_verified promotion WITHOUT invalidating the receipt.
+    "profile_id", "project", "component", "operation", "host", "command",
+    "selectors", "deadlines", "environment", "preparation", "inputs",
+    "capabilities", "variant_defaults", "isolation",
+)
+
+
+def admission_identity(profile: dict) -> str:
+    """SHA-256 over the execution-relevant profile fields, canonically.
+
+    This is the hash bound into admission receipts: promoting a draft
+    (status/admission_receipt/notes edits) never changes it; changing the
+    command, environment, deadlines, selectors or preparation always does.
+    """
+    material = {key: profile.get(key) for key in ADMISSION_IDENTITY_FIELDS}
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def verify_admission(profile: dict, *, scored: bool,
                      profile_path: Path | None = None) -> list[str]:
     """Return admission violations (empty list = usable as requested).
@@ -67,13 +89,22 @@ def verify_admission(profile: dict, *, scored: bool,
                       f"({len(runs)} < {REQUIRED_ADMISSION_REPEATS})")
     if receipt.get("admission") != profile["profile_id"]:
         errors.append("admission receipt belongs to a different profile id")
+    identity_sha = receipt.get("profile_identity_sha256")
     recorded_sha = receipt.get("profile_sha256")
-    if recorded_sha:
+    if identity_sha:
+        current = admission_identity(profile)
+        if current != identity_sha:
+            errors.append("execution-relevant profile fields changed since "
+                          "admission (identity sha mismatch); re-admission "
+                          "required")
+    elif recorded_sha:
+        # Pre-identity receipts bound the whole file; administrative edits
+        # (status promotion) invalidate them — re-admit to migrate.
         if profile_path is not None and profile_path.is_file():
             actual = hashlib.sha256(profile_path.read_bytes()).hexdigest()
             if actual != recorded_sha:
-                errors.append("profile changed since admission (sha256 "
-                              "mismatch); re-admission required")
+                errors.append("profile file changed since admission (full-file "
+                              "sha mismatch); re-admission required")
         else:
             errors.append("receipt records profile_sha256 but no profile "
                           "file was provided to verify against")
@@ -96,12 +127,11 @@ def verify_admission(profile: dict, *, scored: bool,
         if not same:
             errors.append("recorded admission argv differs from the current "
                           "profile render; re-admission required")
-    # Receipts with neither profile_sha256 nor recorded argv+source_root
-    # cannot prove identity across profile edits: reject them for scored
-    # operations (the docs guarantee "changed command => re-admission" would
-    # otherwise be vacuous). Re-admit to obtain a binding receipt.
-    if not recorded_sha and not (runs and runs[0].get("argv")
-                                 and receipt.get("source_root")):
+    # Receipts with no identity binding at all (no identity sha, no full-file
+    # sha, no recorded argv+source_root) cannot prove identity across profile
+    # edits: reject them for scored operations. Re-admit to obtain one.
+    if not identity_sha and not recorded_sha and not (
+            runs and runs[0].get("argv") and receipt.get("source_root")):
         errors.append("admission receipt carries no identity binding "
                       "(profile_sha256 or recorded argv+source_root); "
                       "re-admission required for scored operations")

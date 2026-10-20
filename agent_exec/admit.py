@@ -106,13 +106,13 @@ def run_admission(profile_path: Path, repeats: int, output: Path,
         and all(r["generated_outputs_present"].values())
         for r in runs)
     margins = [rendered.deadlines["hard_seconds"] for _ in runs]
-    import hashlib as _hashlib
+    from .profiles import admission_identity
     receipt = {
         "schema_version": 1,
         "admission": profile["profile_id"],
         "status_before": profile["status"],
         "repeats": len(runs),
-        "profile_sha256": _hashlib.sha256(profile_path.read_bytes()).hexdigest(),
+        "profile_identity_sha256": admission_identity(profile),
         "source_root": str(source_root),
         "source_policy": "owned copy; production checkout never scored",
         "storage_before": storage,

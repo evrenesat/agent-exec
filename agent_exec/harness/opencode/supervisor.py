@@ -90,14 +90,56 @@ class Supervisor:
         rendered = render(profile, source_root=str(source_root), job_id=request_id,
                           report_dir=str(report_dir),
                           selectors=spec.get("selectors") or None)
-        return list(rendered.argv), rendered.deadlines["hard_seconds"], \
-            f"admitted:{profile_id}"
+        return (list(rendered.argv), rendered.deadlines["hard_seconds"],
+                rendered.cwd, f"admitted:{profile_id}")
 
     def validate_request_id(self, request_id: str) -> str:
         """Restrictive id policy: it becomes part of a filesystem path."""
         if not isinstance(request_id, str) or not REQUEST_ID_PATTERN.fullmatch(request_id):
             raise JobError("invalid request_id: must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
         return request_id
+
+    def job_reports(self, job_id: str, receipt: dict) -> list[dict]:
+        """Parse per-job reports according to the bound profile's report
+        definitions (vitest-json | junit | go-test-json). Legacy unscored
+        operations fall back to probing vitest-json.json."""
+        from agent_exec import reports as report_reader
+        from agent_exec.contracts import ProfileError
+        from agent_exec.profiles import load_profile
+        row = self.controller.store.get_job(job_id)
+        if row is None:
+            return []
+        job_reports_dir = (self.controller.evidence_root / "jobs" /
+                           f"{row['session_id']}-{row['request_id']}" / "reports")
+        definitions = []
+        profile_id = row.get("profile_id")
+        if profile_id:
+            profile_path = self.profiles_dir / f"{profile_id}.json"
+            if profile_path.is_file():
+                try:
+                    definitions = load_profile(profile_path).get("reports", [])
+                except ProfileError:
+                    definitions = []
+        summaries = []
+        if definitions:
+            for report in definitions:
+                path = Path(report["path_template"].format(
+                    report_dir=str(job_reports_dir), job_id=row["request_id"]))
+                kind = report.get("kind")
+                if kind == "vitest-json":
+                    summaries.append(report_reader.read_vitest_json(path))
+                elif kind == "junit":
+                    summaries.append(report_reader.read_junit_xml(path))
+                elif kind == "go-test-json":
+                    summaries.append(report_reader.read_go_test_json(path))
+                else:
+                    summaries.append({"kind": kind, "integrity": "unsupported",
+                                      "complete": False})
+            return summaries
+        fallback = job_reports_dir / "vitest-json.json"
+        if fallback.is_file():
+            summaries.append(report_reader.read_vitest_json(fallback))
+        return summaries
 
     def job_dir_for(self, session_id: str, request_id: str) -> Path:
         """Job directory under the evidence root; refuses any escape."""
@@ -184,10 +226,14 @@ class Supervisor:
             argv = [part.replace("{report_dir}", str(report_dir))
                     for part in spec["argv"]]
         else:
-            argv, profile_deadline, origin = self.resolve_operation_command(
-                operation, spec, request_id, report_dir)
+            argv, profile_deadline, profile_cwd, origin = \
+                self.resolve_operation_command(
+                    operation, spec, request_id, report_dir)
             deadline = min(deadline if requested is not None else profile_deadline,
                            profile_deadline, self.max_deadline_seconds)
+            # The profile is the authority for the working directory of
+            # profile-bound operations.
+            cwd = profile_cwd
         result = self.controller.launch(
             argv, request_id=str(request_id), operation_id=operation,
             deadline_seconds=deadline, stop_grace_seconds=5, env=env,
@@ -242,14 +288,7 @@ def make_handler(supervisor: Supervisor):
                 job_id = self.path.rsplit("/", 1)[-1]
                 try:
                     receipt = supervisor.controller.status(job_id)
-                    from agent_exec import reports as report_reader
-                    row = supervisor.controller.store.get_job(job_id)
-                    if row is not None:
-                        job_dir = (supervisor.controller.evidence_root / "jobs" /
-                                   f"{row['session_id']}-{row['request_id']}")
-                        report_file = job_dir / "reports" / "vitest-json.json"
-                        if report_file.is_file():
-                            receipt["report"] = report_reader.read_vitest_json(report_file)
+                    receipt["reports"] = supervisor.job_reports(job_id, receipt)
                     self._json(200, receipt)
                 except JobError as error:
                     self._json(404, {"error": str(error)})

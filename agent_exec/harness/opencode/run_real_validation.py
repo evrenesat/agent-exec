@@ -28,8 +28,8 @@ RELAY_URL = "http://127.0.0.1:18489/v1"
 MODEL = "qfn/qwen3.8-flash-next-iq3_s"
 PROMPT = ("Use the project_run tool exactly once to run operation 'aflow.web.unit' "
           "with request_id 'qfn-validate-1'. Wait for its terminal receipt, then "
-          "report verbatim: outcome, exit_status, the test totals from the receipt, "
-          "and cleanup. Do not run any other tools and do not retry.")
+          "report verbatim: the job id, outcome, exit_status, the test totals from "
+          "the receipt, and cleanup. Do not run any other tools and do not retry.")
 
 
 def wait_health(url: str, token: str, timeout: float = 20) -> None:
