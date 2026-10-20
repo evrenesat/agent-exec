@@ -191,9 +191,6 @@ class ConcurrentMalformedRequestsTests(unittest.TestCase):
             tmp.cleanup()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class HttpRoundTripTests(unittest.TestCase):
     """Real HTTP round trips (the reviewer's gap: predicate-only tests missed
@@ -372,3 +369,6 @@ class ReportDispatchTests(unittest.TestCase):
             {"go-test.jsonl": report}, ("go-test-json", "go-test.jsonl"))
         self.assertEqual(summaries[0]["kind"], "go-test-json")
         self.assertEqual(summaries[0]["tests_passed"], 1)
+
+if __name__ == "__main__":
+    unittest.main()
