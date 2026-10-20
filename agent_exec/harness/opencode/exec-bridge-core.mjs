@@ -9,6 +9,47 @@ export const DEFAULTS = {
   maxWaitMs: 60000,
 };
 
+// GET /jobs/<id> carries `reports` — an ARRAY of parsed report summaries
+// (review P1-1; supervisor.py job_reports) — with kind-specific counters:
+// vitest-json/junit expose total/passed/failed; go-test-json exposes
+// tests_passed/tests_failed/tests_skipped. mapJobReports normalizes that
+// array into one bounded model-facing summary per report. Pure, total
+// (never throws), empty/missing input maps to [].
+export const MAX_JOB_REPORTS = 8;
+
+export function mapJobReports(reports) {
+  try {
+    if (!Array.isArray(reports)) return [];
+    return reports.slice(0, MAX_JOB_REPORTS).map((report) => {
+      const summary = {
+        kind: typeof report?.kind === "string" ? report.kind : "unknown",
+        integrity: report?.integrity ?? null,
+        complete: report?.complete === true,
+        total: null,
+        passed: null,
+        failed: null,
+      };
+      if (summary.kind === "go-test-json") {
+        const passed = Number(report?.tests_passed);
+        const failed = Number(report?.tests_failed);
+        const skipped = Number(report?.tests_skipped);
+        summary.passed = Number.isFinite(passed) ? passed : 0;
+        summary.failed = Number.isFinite(failed) ? failed : 0;
+        summary.total = summary.passed + summary.failed +
+          (Number.isFinite(skipped) ? skipped : 0);
+      } else {
+        // vitest-json, junit and unknown kinds: keep the counters as-is.
+        if (Number.isFinite(report?.total)) summary.total = report.total;
+        if (Number.isFinite(report?.passed)) summary.passed = report.passed;
+        if (Number.isFinite(report?.failed)) summary.failed = report.failed;
+      }
+      return summary;
+    });
+  } catch {
+    return [];
+  }
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class BridgeCore {

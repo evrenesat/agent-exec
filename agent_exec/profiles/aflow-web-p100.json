@@ -5,7 +5,7 @@
   "component": "web",
   "operation": "unit",
   "status": "fixture_verified",
-  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-aflow-web-v2/admission-receipt.json",
+  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-aflow-web-v3/admission-receipt.json",
   "host": {
     "hostname": "codex",
     "os": "linux",

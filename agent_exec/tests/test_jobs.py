@@ -834,6 +834,164 @@ class ReconcileCancelCasTests(unittest.TestCase):
             controller.close()
 
 
+class RaceyVerdictBackend(FakeBackend):
+    """classify() hands each caller a DIFFERENT verdict behind a barrier,
+    reproducing two concurrent observers that disagree about the terminal
+    outcome of the same unit. The first classify() call yields `first`,
+    the second `second`."""
+
+    def __init__(self, first, second):
+        super().__init__()
+        self._verdicts = [dict(first), dict(second)]
+        self._lock = threading.Lock()
+        self._barrier = threading.Barrier(2, timeout=10)
+
+    def classify(self, observation, cancel_requested=False):
+        with self._lock:
+            verdict = self._verdicts.pop(0)
+        self._barrier.wait()
+        return verdict
+
+
+class ConcurrentFinalizationTests(unittest.TestCase):
+    """Review P1-5: the terminal/reconciled event is emitted only by the
+    writer whose CAS won; a losing finalizer must not publish a second
+    event and must return the SAME stored receipt as the winner."""
+
+    PASS_OBSERVATION = {
+        "phase": "terminal",
+        "exit_record": {"service_result": "success", "exit_code": "exited",
+                        "exit_status": "0"},
+        "cgroup": "verified_empty",
+    }
+    TIMEOUT_OBSERVATION = {
+        "phase": "terminal",
+        "exit_record": {"service_result": "timeout", "exit_code": "killed",
+                        "exit_status": "KILL"},
+        "cgroup": "verified_empty",
+    }
+    INCONCLUSIVE_OBSERVATION = {
+        "phase": "inconclusive", "ended": True, "exit_record": None,
+        "cgroup": "unknown",
+        "warning": "missing usable exit evidence (branch test)",
+    }
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "evidence",
+                                        session_id="session-A",
+                                        backend=self.backend)
+
+    def tearDown(self):
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def _launched_job(self, request_id):
+        job = self.controller.launch(["/bin/true"], request_id=request_id,
+                                     operation_id="op")["job_id"]
+        row = self.controller.store.get_job(job)
+        spec = self.controller._spec_for(row)
+        return job, row, spec
+
+    def _terminal_events(self, job_id, kinds=("terminal",)):
+        events = self.controller.events(job_id)["events"]
+        return [e for e in events if e["kind"] in kinds]
+
+    def test_conflicting_absorb_terminal_emits_one_terminal_event(self):
+        job, row, spec = self._launched_job("dup1")
+        first = self.controller._absorb_terminal(job, row, spec,
+                                                 self.PASS_OBSERVATION)
+        second = self.controller._absorb_terminal(job, row, spec,
+                                                  self.TIMEOUT_OBSERVATION)
+        # Exactly one terminal event, describing the winner.
+        terminals = self._terminal_events(job)
+        self.assertEqual(len(terminals), 1)
+        stored = self.controller.store.get_job(job)
+        self.assertEqual(stored["state"], "completed")
+        self.assertEqual(stored["outcome"], "passed")
+        self.assertEqual(terminals[0]["payload"]["outcome"], "passed")
+        # Both callers receive the SAME final receipt (the stored one),
+        # never the locally computed losing verdict.
+        self.assertEqual(first, second)
+        self.assertEqual(first["outcome"], "passed")
+        self.assertEqual(first["job_id"], job)
+
+    def test_absorb_then_inconclusive_emits_one_wake_event(self):
+        job, row, spec = self._launched_job("dup2")
+        first = self.controller._absorb_terminal(job, row, spec,
+                                                 self.PASS_OBSERVATION)
+        second = self.controller._finalize_inconclusive(
+            job, self.INCONCLUSIVE_OBSERVATION)
+        wake = self._terminal_events(job, kinds=("terminal", "reconciled"))
+        self.assertEqual(len(wake), 1)
+        self.assertEqual(wake[0]["kind"], "terminal")
+        stored = self.controller.store.get_job(job)
+        self.assertEqual(stored["outcome"], "passed")
+        self.assertEqual(first, second)
+        self.assertEqual(first["outcome"], "passed")
+
+    def test_inconclusive_then_absorb_emits_one_wake_event(self):
+        job, row, spec = self._launched_job("dup3")
+        first = self.controller._finalize_inconclusive(
+            job, self.INCONCLUSIVE_OBSERVATION)
+        second = self.controller._absorb_terminal(job, row, spec,
+                                                  self.PASS_OBSERVATION)
+        wake = self._terminal_events(job, kinds=("terminal", "reconciled"))
+        self.assertEqual(len(wake), 1)
+        self.assertEqual(wake[0]["kind"], "reconciled")
+        stored = self.controller.store.get_job(job)
+        self.assertEqual(stored["outcome"], "inconclusive")
+        self.assertEqual(first, second)
+        self.assertEqual(first["outcome"], "inconclusive")
+
+    def test_concurrent_conflicting_verdicts_single_terminal_event(self):
+        pass_verdict = linux_jobs.classify(self.PASS_OBSERVATION)
+        timeout_verdict = linux_jobs.classify(self.TIMEOUT_OBSERVATION)
+        backend = RaceyVerdictBackend(pass_verdict, timeout_verdict)
+        controller = JobController(self.root / "store-race.sqlite",
+                                   evidence_root=self.root / "evidence-race",
+                                   session_id="session-A", backend=backend)
+        try:
+            job = controller.launch(["/bin/true"], request_id="race",
+                                    operation_id="op")["job_id"]
+            spec = controller._spec_for(controller.store.get_job(job))
+            backend.set_terminal(spec, {"service_result": "success",
+                                        "exit_code": "exited",
+                                        "exit_status": "0"})
+            receipts, errors = [], []
+
+            def observe():
+                try:
+                    receipts.append(controller.status(job))
+                except Exception as error:  # noqa: BLE001 — surfaced below
+                    errors.append(error)
+
+            threads = [threading.Thread(target=observe) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(receipts), 2)
+            # Exactly one terminal event; its verdict matches the stored row.
+            events = controller.events(job)["events"]
+            terminals = [e for e in events if e["kind"] == "terminal"]
+            self.assertEqual(len(terminals), 1)
+            stored = controller.store.get_job(job)
+            self.assertEqual(stored["state"], "completed")
+            self.assertEqual(terminals[0]["payload"]["outcome"],
+                             stored["outcome"])
+            # Both concurrent callers receive the SAME stored receipt.
+            self.assertEqual(receipts[0], receipts[1])
+            self.assertEqual(receipts[0]["outcome"], stored["outcome"])
+        finally:
+            controller.close()
+
+
 class CgroupStateTests(unittest.TestCase):
     """Review P2: unreadable cgroup evidence must be "unknown", never a
     quiet "verified_empty" (Path.exists() is False on EACCES too)."""

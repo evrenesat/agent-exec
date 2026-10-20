@@ -370,5 +370,127 @@ class ReportDispatchTests(unittest.TestCase):
         self.assertEqual(summaries[0]["kind"], "go-test-json")
         self.assertEqual(summaries[0]["tests_passed"], 1)
 
+
+class JobReportsHttpTests(unittest.TestCase):
+    """P1-1 wire-shape pin: GET /jobs/<id> returns report summaries as the
+    ARRAY `reports` (supervisor.py job_reports), with kind-specific
+    counters. The JS bridge consumers normalize this via mapJobReports
+    (exec-bridge-core.mjs / pi-bridge-core.mjs); this test pins the exact
+    JSON body shape those consumers rely on, over real HTTP."""
+
+    def setUp(self):
+        import tempfile
+        import threading
+        from http.client import HTTPConnection
+        from http.server import ThreadingHTTPServer
+        self.http = HTTPConnection
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.profiles_dir = self.root / "profiles"
+        self.profiles_dir.mkdir()
+        self.evidence = self.root / "evidence"
+        self.evidence.mkdir()
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.evidence,
+                                        session_id="sess", backend=self.backend)
+        # Disposable source tree as a SUBDIRECTORY: the job report dir lives
+        # under the evidence root, legitimately outside the source tree.
+        src = self.root / "src"
+        src.mkdir()
+        receipt = {"passed": True, "repeats": 3, "admission": "demo.web.unit",
+                   "source_root": str(src),
+                   "runs": [{"repeat": i, "argv": ["/bin/true"],
+                             "outcome": "passed",
+                             "cleanup": "verified_empty"} for i in (1, 2, 3)]}
+        (self.root / "receipt.json").write_text(json.dumps(receipt))
+        profile = {
+            "schema_version": 1, "profile_id": "demo.web.unit",
+            "project": "demo", "component": "web", "operation": "unit",
+            "status": "fixture_verified",
+            "host": {"hostname": "any"},
+            "command": {"argv_template": ["/bin/true"], "cwd": "{source_root}"},
+            "selectors": {"allowed_kinds": ["file"], "base": ""},
+            "deadlines": {"diagnose_seconds": 10, "hard_seconds": 30},
+            "capabilities": {}, "inputs": {"fingerprints": [], "generated": []},
+            "reports": [{"kind": "vitest-json",
+                         "path_template": "{report_dir}/vitest-json.json",
+                         "admitted": True}],
+            "admission_receipt": str(self.root / "receipt.json"),
+        }
+        (self.profiles_dir / "demo.web.unit.json").write_text(
+            json.dumps(profile, indent=2))
+        self.supervisor = Supervisor(self.controller, {
+            "demo.web.unit": {"profile_id": "demo.web.unit", "scored": False,
+                              "source_root": str(src)},
+        }, token="tok-123", profiles_dir=self.profiles_dir)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                          make_handler(self.supervisor))
+        self.port = self.server.server_port
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def request(self, method, path, body=None):
+        conn = self.http("127.0.0.1", self.port, timeout=10)
+        headers = {"X-Agent-Exec-Token": "tok-123"}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=payload, headers=headers)
+        response = conn.getresponse()
+        data = json.loads(response.read() or b"{}")
+        conn.close()
+        return response.status, data
+
+    def test_get_job_returns_reports_array_over_http(self):
+        status, body = self.request("POST", "/jobs",
+                                    {"operation": "demo.web.unit",
+                                     "request_id": "rp1"})
+        self.assertEqual(status, 200)
+        job_id = body["job_id"]
+        report_dir = self.evidence / "jobs" / "sess-rp1" / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "vitest-json.json").write_text(json.dumps({
+            "numTotalTests": 5, "numPassedTests": 4, "numFailedTests": 1,
+            "success": False,
+            "testResults": [{"assertionResults": [
+                {"status": "failed", "fullName": "a", "failureMessages": []},
+            ]}],
+        }))
+        status, body = self.request("GET", f"/jobs/{job_id}")
+        self.assertEqual(status, 200)
+        # mapJobReports contract input: `reports` is an array of parsed
+        # summaries — the old singular `report` field never exists.
+        self.assertIsInstance(body.get("reports"), list)
+        self.assertEqual(len(body["reports"]), 1)
+        first = body["reports"][0]
+        self.assertEqual(first["kind"], "vitest-json")
+        self.assertIsInstance(first["total"], int)
+        self.assertEqual(first["total"], 5)
+        self.assertEqual(first["passed"], 4)
+        self.assertEqual(first["failed"], 1)
+
+    def test_get_job_without_report_file_keeps_reports_array_empty_or_missing(self):
+        status, body = self.request("POST", "/jobs",
+                                    {"operation": "demo.web.unit",
+                                     "request_id": "rp2"})
+        self.assertEqual(status, 200)
+        status, body = self.request("GET", f"/jobs/{body['job_id']}")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body.get("reports"), list)
+        # Missing report file -> one integrity="missing" summary, never a
+        # fabricated pass and never a null singular report.
+        self.assertEqual(body["reports"][0]["integrity"], "missing")
+
+
 if __name__ == "__main__":
     unittest.main()

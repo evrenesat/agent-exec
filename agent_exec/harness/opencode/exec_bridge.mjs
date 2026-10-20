@@ -1,7 +1,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { tool } from "@opencode-ai/plugin";
-import { BridgeCore } from "./exec-bridge-core.mjs";
+import { BridgeCore, mapJobReports } from "./exec-bridge-core.mjs";
 
 // Execution-layer bridge for OpenCode 1.18.25: named project operations run
 // through the supervisor (which alone owns launches, systemd units and
@@ -70,10 +70,9 @@ export default async function ExecBridge() {
         output: JSON.stringify({ launch, receipt, job: job && {
           outcome: job.outcome, exit_code: job.exit_code,
           exit_status: job.exit_status, cleanup: job.cleanup,
-          report: job.report ? {
-            total: job.report.total, passed: job.report.passed,
-            failed: job.report.failed, complete: job.report.complete,
-          } : null },
+          // P1-1: the supervisor payload's report field is the ARRAY
+          // `job.reports` (kind-specific counters), not a singular report.
+          reports: mapJobReports(job.reports) },
         }),
         metadata: { supervisor: config.supervisorName ?? "exec-supervisor",
           job_id: launch.job_id, replayed: launch.replayed === true },

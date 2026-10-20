@@ -276,45 +276,41 @@ class JobController:
     def _finalize_inconclusive(self, job_id: str, observation: dict) -> dict:
         import json as _json
         record = _json.dumps(observation.get("exit_record"))
-        self.store.update_job_if_state(job_id, ("starting", "queued", "running"),
-                                       state="completed", outcome="inconclusive",
-                                       exit_record_json=record,
-                                       cleanup=observation.get("cgroup", "unknown"),
-                                       terminal_wall=time.time())
-        self.store.record_event(job_id, "reconciled", {
-            "outcome": "inconclusive", "cleanup": observation.get("cgroup"),
-            "reason": observation.get("warning") or "missing usable exit evidence"})
+        # CAS: a concurrent observer may finalize this row first (possibly
+        # with a different verdict). Only the winner emits the reconciled
+        # event; both callers report the SAME stored receipt.
+        finalized = self.store.update_job_if_state(
+            job_id, ("starting", "queued", "running"),
+            state="completed", outcome="inconclusive",
+            exit_record_json=record,
+            cleanup=observation.get("cgroup", "unknown"),
+            terminal_wall=time.time())
+        if finalized:
+            self.store.record_event(job_id, "reconciled", {
+                "outcome": "inconclusive", "cleanup": observation.get("cgroup"),
+                "reason": observation.get("warning") or "missing usable exit evidence"})
         return self._receipt(self.store.get_job(job_id))
 
     def _absorb_terminal(self, job_id: str, row: dict, spec, observation) -> dict:
         verdict = self.backend.classify(
             observation, cancel_requested=bool(row["cancel_requested"]))
-        receipt = {
-            "job_id": job_id, "operation_id": row["operation_id"],
-            "unit": row["unit"], "invocation_id": row["invocation_id"],
-            "boot_id": row["boot_id"],
-            "outcome": verdict["outcome"],
-            "service_result": verdict["service_result"],
-            "exit_code": verdict["exit_code"],
-            "exit_status": verdict["exit_status"],
-            "cleanup": verdict["cleanup"],
-            "inconclusive_reason": verdict["inconclusive_reason"],
-            "cancel_requested": bool(row["cancel_requested"]),
-            "started_wall": row["started_wall"],
-            "terminal_wall": time.time(),
-            "freshness": "fresh",
-        }
         import json as _json
-        self.store.update_job_if_state(
+        terminal_wall = time.time()
+        # CAS: a concurrent observer may finalize this row first with a
+        # DIFFERENT verdict. Only the winner emits the terminal event; every
+        # caller — winner or loser — returns the SAME authoritative stored
+        # receipt, never a locally computed one.
+        finalized = self.store.update_job_if_state(
             job_id, ("starting", "queued", "running"),
             state="completed", outcome=verdict["outcome"],
             exit_record_json=_json.dumps(observation.get("exit_record")),
-            cleanup=verdict["cleanup"], terminal_wall=receipt["terminal_wall"])
-        self.store.record_event(job_id, "terminal", {
-            "outcome": verdict["outcome"], "cleanup": verdict["cleanup"],
-            "service_result": verdict["service_result"],
-            "exit_code": verdict["exit_code"], "exit_status": verdict["exit_status"]})
-        return receipt
+            cleanup=verdict["cleanup"], terminal_wall=terminal_wall)
+        if finalized:
+            self.store.record_event(job_id, "terminal", {
+                "outcome": verdict["outcome"], "cleanup": verdict["cleanup"],
+                "service_result": verdict["service_result"],
+                "exit_code": verdict["exit_code"], "exit_status": verdict["exit_status"]})
+        return self._receipt(self.store.get_job(job_id))
 
     def _receipt(self, row: dict) -> dict:
         import json as _json

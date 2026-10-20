@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
 
 from agent_exec.reports import (  # noqa: E402
-    read_junit_xml, read_vitest_json, summarize)
+    read_go_test_json, read_junit_xml, read_vitest_json, summarize)
 
 
 def valid_report(total=3, failed=0):
@@ -125,6 +125,117 @@ class SummarizeTests(unittest.TestCase):
         self.assertFalse(summarize([good, partial])["all_complete"])
         self.assertTrue(summarize([good, good])["all_complete"])
         self.assertFalse(summarize([])["all_complete"])
+
+
+# ---------------------------------------------------------------------------
+# read_go_test_json: real test2json event shapes (grammar per
+# tests/test_go.py, captured from go1.24.13 on p100)
+# ---------------------------------------------------------------------------
+
+def _go_event(action, package=None, test=None, elapsed=None, output=None):
+    event = {"Action": action, "Time": "2026-10-15T12:00:00.000000000Z"}
+    if package is not None:
+        event["Package"] = package
+    if test is not None:
+        event["Test"] = test
+    if elapsed is not None:
+        event["Elapsed"] = elapsed
+    if output is not None:
+        event["Output"] = output
+    return event
+
+
+GO_PKG = "example.com/app/internal/cli"
+
+GO_PASS_STREAM = "\n".join(json.dumps(e) for e in [
+    _go_event("start", package=GO_PKG),
+    _go_event("run", package=GO_PKG, test="TestAlpha"),
+    _go_event("output", package=GO_PKG, test="TestAlpha",
+              output="=== RUN   TestAlpha\n"),
+    _go_event("output", package=GO_PKG, test="TestAlpha",
+              output="--- PASS: TestAlpha (0.00s)\n"),
+    _go_event("pass", package=GO_PKG, test="TestAlpha", elapsed=0.0),
+    _go_event("output", package=GO_PKG,
+              output="ok  \texample.com/app/internal/cli\t0.157s\n"),
+    _go_event("pass", package=GO_PKG, elapsed=0.157),
+]) + "\n"
+
+GO_ALL_NO_TEST_STREAM = "\n".join(json.dumps(e) for e in [
+    _go_event("start", package=GO_PKG),
+    _go_event("output", package=GO_PKG,
+              output="?   \texample.com/app/internal/cli\t[no test files]\n"),
+    _go_event("skip", package=GO_PKG, elapsed=0),
+]) + "\n"
+
+GO_FAIL_STREAM = "\n".join(json.dumps(e) for e in [
+    _go_event("start", package=GO_PKG),
+    _go_event("run", package=GO_PKG, test="TestBad"),
+    _go_event("output", package=GO_PKG, test="TestBad",
+              output="=== RUN   TestBad\n"),
+    _go_event("output", package=GO_PKG, test="TestBad",
+              output="    stream_test.go:9: assertion failed: expected 2 got 3\n"),
+    _go_event("output", package=GO_PKG, test="TestBad",
+              output="--- FAIL: TestBad (0.00s)\n"),
+    _go_event("fail", package=GO_PKG, test="TestBad", elapsed=0.0),
+    _go_event("output", package=GO_PKG,
+              output="FAIL\texample.com/app/internal/cli\t0.002s\n"),
+    _go_event("fail", package=GO_PKG, elapsed=0.002),
+]) + "\n"
+
+
+class GoTestJsonTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _read(self, stream: str) -> dict:
+        path = self.dir / "go-test.json"
+        path.write_text(stream)
+        return read_go_test_json(path)
+
+    def test_all_no_test_packages_are_not_complete(self):
+        # Complete stream, every package skipped for [no test files]: zero
+        # collected tests is an incomplete required check, never success.
+        result = self._read(GO_ALL_NO_TEST_STREAM)
+        self.assertEqual(result["integrity"], "complete")
+        self.assertEqual(result["overall"], "no_tests")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["packages_no_tests"], 1)
+        self.assertEqual(result["tests_executed"], 0)
+        self.assertTrue(any("never success" in note for note in result["notes"]))
+
+    def test_passing_stream_with_executed_tests_is_complete(self):
+        result = self._read(GO_PASS_STREAM)
+        self.assertEqual(result["overall"], "passed")
+        self.assertTrue(result["complete"])
+        self.assertEqual((result["tests_passed"], result["tests_executed"]), (1, 1))
+
+    def test_passing_stream_with_no_test_package_stays_complete(self):
+        # One executed passing package plus one no-test package: still a
+        # pass, with the no-test package separately counted and noted.
+        mixed = GO_PASS_STREAM + "\n" + "\n".join(
+            json.dumps(e) for e in [
+                _go_event("start", package="example.com/app/cmd/app"),
+                _go_event("output", package="example.com/app/cmd/app",
+                          output="?   \texample.com/app/cmd/app\t[no test files]\n"),
+                _go_event("skip", package="example.com/app/cmd/app", elapsed=0),
+            ]) + "\n"
+        result = self._read(mixed)
+        self.assertEqual(result["overall"], "passed")
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["packages_no_tests"], 1)
+        self.assertTrue(any("counted separately" in note for note in result["notes"]))
+
+    def test_failing_stream_is_incomplete_with_failures_preserved(self):
+        result = self._read(GO_FAIL_STREAM)
+        self.assertEqual(result["overall"], "failed")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["tests_failed"], 1)
+        self.assertEqual(result["failures"][0]["test"], "TestBad")
+        self.assertIn("expected 2 got 3", result["failures"][0]["output"])
 
 
 if __name__ == "__main__":

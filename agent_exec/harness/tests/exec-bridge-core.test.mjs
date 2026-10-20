@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BridgeCore } from "../opencode/exec-bridge-core.mjs";
+import { BridgeCore, mapJobReports } from "../opencode/exec-bridge-core.mjs";
 
 function fakeFetch(routes) {
   const calls = [];
@@ -175,4 +175,70 @@ test("launch sends the auth token header (regression: duplicate headers key)", a
   // Poll path too.
   await core.pollOnce();
   assert.equal(seen[1]["X-Agent-Exec-Token"], "tok-abc");
+});
+
+// P1-1 regression: GET /jobs/<id> returns report SUMMARIES as the array
+// `reports` (supervisor.py job_reports), so the model-facing payload must
+// normalize per-kind counters instead of reading a singular `job.report`.
+test("mapJobReports: vitest-json summary passes counters through as-is", () => {
+  const out = mapJobReports([
+    { kind: "vitest-json", integrity: "valid", complete: true,
+      total: 42, passed: 40, failed: 2 },
+  ]);
+  assert.deepEqual(out, [
+    { kind: "vitest-json", integrity: "valid", complete: true,
+      total: 42, passed: 40, failed: 2 },
+  ]);
+});
+
+test("mapJobReports: junit summary keeps total/failed, absent passed stays null", () => {
+  const out = mapJobReports([
+    { kind: "junit", integrity: "valid", complete: true,
+      total: 4, failed: 1, errors: 0, skipped: 0 },
+  ]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, "junit");
+  assert.equal(out[0].total, 4);
+  assert.equal(out[0].failed, 1);
+  assert.equal(out[0].passed, null);
+});
+
+test("mapJobReports: go-test-json counters fold into total/passed/failed", () => {
+  const out = mapJobReports([
+    { kind: "go-test-json", integrity: "complete", complete: true,
+      tests_passed: 29, tests_failed: 3, tests_skipped: 2,
+      packages_no_tests: 1, packages_cached: 4 },
+  ]);
+  assert.deepEqual(out, [
+    { kind: "go-test-json", integrity: "complete", complete: true,
+      total: 34, passed: 29, failed: 3 },
+  ]);
+});
+
+test("mapJobReports: null, undefined and empty array all map to []", () => {
+  assert.deepEqual(mapJobReports(null), []);
+  assert.deepEqual(mapJobReports(undefined), []);
+  assert.deepEqual(mapJobReports([]), []);
+});
+
+test("mapJobReports: unknown kind passes through intact without throwing", () => {
+  const out = mapJobReports([
+    { kind: "mystery-format", integrity: "valid", complete: false },
+    null,
+    7,
+    "not-an-object",
+  ]);
+  assert.equal(out.length, 4);
+  assert.equal(out[0].kind, "mystery-format");
+  assert.equal(out[0].integrity, "valid");
+  assert.equal(out[0].complete, false);
+  for (const entry of out.slice(1)) {
+    assert.deepEqual(entry,
+      { kind: "unknown", integrity: null, complete: false,
+        total: null, passed: null, failed: null });
+  }
+  // Non-array garbage never throws either.
+  assert.deepEqual(mapJobReports({ kind: "vitest-json" }), []);
+  assert.deepEqual(mapJobReports(42), []);
+  assert.deepEqual(mapJobReports("nope"), []);
 });

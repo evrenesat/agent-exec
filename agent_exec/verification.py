@@ -54,38 +54,35 @@ class VerificationLedger:
     (observe_from_store(): the controller itself fetched the receipt),
     ``manual`` (a declared human acceptance), or ``caller`` (a
     caller-supplied receipt body passed to observe()). An automated
-    ``passed`` with ``observed_via='caller'`` is valid only when the
-    receipt genuinely came from a controller; reviewers should treat
-    caller-bound automated passes as unverified provenance and prefer
-    re-observation through observe_from_store().
+    ``passed`` counts toward manifest ``complete`` ONLY with ``store``
+    provenance: a caller-supplied automated pass stays visible with its
+    state and provenance but never completes the manifest — re-observe
+    the same requirement through observe_from_store() to count it.
+    ``observed_via='store'`` cannot be requested through observe() at
+    all: it is produced exclusively by observe_from_store(), which
+    fetches the receipt through the controller itself.
     """
 
     def __init__(self, requirements: list[Requirement]):
         self.requirements = {r.requirement_id: r for r in requirements}
         self.entries: dict[str, LedgerEntry] = {}
 
-    def observe(self, *, requirement_id: str, job_id: str | None, outcome: str,
-                receipt: dict | None = None, input_fingerprint: str | None = None,
-                wall: float | None = None,
-                observed_via: str | None = None,
-                _store_stamp: bool = False) -> LedgerEntry:
+    def _record(self, *, requirement_id: str, job_id: str | None, outcome: str,
+                receipt: dict | None, input_fingerprint: str | None,
+                wall: float | None, observed_via: str) -> LedgerEntry:
+        """Recording core shared by observe() and observe_from_store().
+
+        Validates the requirement id, the outcome state and the receipt
+        body of an automated pass, then stores the entry verbatim under
+        the provenance the caller supplies. It applies NO provenance
+        policy: deciding which caller may claim which ``observed_via``
+        is the responsibility of the public entry points.
+        """
         if requirement_id not in self.requirements:
             raise KeyError(f"unknown requirement: {requirement_id!r}")
         if outcome not in STATES:
             raise ValueError(f"unknown outcome state: {outcome!r}")
         requirement = self.requirements[requirement_id]
-        if observed_via is None:
-            # Default provenance from the call shape: a manual requirement's
-            # declared acceptance vs. a caller-supplied automated receipt.
-            observed_via = "manual" if requirement.manual else "caller"
-        elif observed_via not in ("store", "caller", "manual"):
-            raise ValueError(f"unknown observed_via: {observed_via!r}")
-        if observed_via == "store" and not _store_stamp:
-            # 'store' provenance is attested by observe_from_store() actually
-            # fetching the receipt from the controller; a caller cannot stamp
-            # it onto a self-supplied receipt body.
-            raise ValueError("observed_via='store' can only be set by "
-                             "observe_from_store()")
         if outcome == "passed" and not requirement.manual:
             # An automated check passes only on the strength of a trusted job
             # receipt: a real job id plus recorded pass AND verified cleanup.
@@ -115,6 +112,43 @@ class VerificationLedger:
             updated_wall=wall if wall is not None else time.time())
         self.entries[requirement_id] = entry
         return entry
+
+    def observe(self, *, requirement_id: str, job_id: str | None, outcome: str,
+                receipt: dict | None = None, input_fingerprint: str | None = None,
+                wall: float | None = None,
+                observed_via: str | None = None) -> LedgerEntry:
+        """Record a caller-supplied observation of a required check.
+
+        Provenance defaults to ``manual`` for manual requirements (a
+        declared human acceptance) and ``caller`` otherwise (a
+        caller-supplied receipt body). ``observed_via='store'`` is
+        REFUSED unconditionally: store provenance is attested only by
+        observe_from_store(), which fetches the CURRENT receipt through
+        the controller itself — no caller-supplied body and no argument
+        shape can produce it here. A caller-supplied automated pass is
+        recorded (visible in the manifest with its state and provenance)
+        but does not count toward manifest ``complete``.
+        """
+        if requirement_id not in self.requirements:
+            raise KeyError(f"unknown requirement: {requirement_id!r}")
+        requirement = self.requirements[requirement_id]
+        if observed_via is None:
+            # Default provenance from the call shape: a manual requirement's
+            # declared acceptance vs. a caller-supplied automated receipt.
+            observed_via = "manual" if requirement.manual else "caller"
+        if observed_via == "store":
+            # 'store' provenance is attested by observe_from_store() actually
+            # fetching the receipt from the controller; a caller can never
+            # stamp it onto a self-supplied receipt body.
+            raise ValueError("observed_via='store' can only be produced by "
+                             "observe_from_store(); use observe_from_store() "
+                             "to record a store-verified check")
+        if observed_via not in ("caller", "manual"):
+            raise ValueError(f"unknown observed_via: {observed_via!r}")
+        return self._record(requirement_id=requirement_id, job_id=job_id,
+                            outcome=outcome, receipt=receipt,
+                            input_fingerprint=input_fingerprint, wall=wall,
+                            observed_via=observed_via)
 
     def observe_from_store(self, controller, *, requirement_id: str, job_id: str,
                            input_fingerprint: str | None = None) -> LedgerEntry:
@@ -185,10 +219,12 @@ class VerificationLedger:
                 state = "passed"
             else:
                 state = "failed"
-        return self.observe(requirement_id=requirement_id, job_id=job_id,
+        # Only this path may stamp store provenance: it goes straight to the
+        # private recording core AFTER the controller fetch/validation above.
+        return self._record(requirement_id=requirement_id, job_id=job_id,
                             outcome=state, receipt=receipt,
-                            input_fingerprint=input_fingerprint,
-                            observed_via="store", _store_stamp=True)
+                            input_fingerprint=input_fingerprint, wall=None,
+                            observed_via="store")
 
     def invalidate_stale(self, current_fingerprint: str | None) -> list[str]:
         """Mark passed receipts stale when the relevant inputs changed.
@@ -232,14 +268,23 @@ class VerificationLedger:
                 "input_fingerprint": entry.input_fingerprint if entry else None,
                 "updated_wall": entry.updated_wall if entry else None,
             }
-            if state != "passed":
+            # An automated requirement counts toward complete ONLY on a
+            # pass whose receipt the controller itself fetched: a
+            # caller-supplied pass (observed_via='caller') stays visible
+            # with its state and provenance but never completes.
+            if state != "passed" or entry is None \
+                    or entry.observed_via != "store":
                 complete = False
         return {
             "schema_version": 1,
             "complete": complete,
             "checks": checks,
             "note": "complete=False is expected until every required check has a "
-                    "fresh passing receipt; a complete manifest still requires "
+                    "fresh passing receipt; an automated check counts toward "
+                    "complete only when observed_from_store() fetched its "
+                    "receipt (observed_via='store') — a caller-supplied pass "
+                    "stays visible with its state and provenance but does not "
+                    "complete; a complete manifest still requires "
                     "independent product review and cannot certify requirement "
                     "semantics by itself",
         }

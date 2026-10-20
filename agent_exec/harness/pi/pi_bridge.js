@@ -17,7 +17,7 @@
 // pollIntervalMs, pollTimeoutMs) or XTX_EXEC_SUPERVISOR_URL directly.
 import { appendFileSync, readFileSync } from "node:fs";
 
-import { BridgeCore } from "./pi-bridge-core.mjs";
+import { BridgeCore, mapJobReports } from "./pi-bridge-core.mjs";
 
 const PROJECT_RUN_PARAMS = {
   type: "object",
@@ -120,9 +120,9 @@ export default function execBridge(pi) {
       const payload = { launch, receipt, job: job && {
         outcome: job.outcome, exit_code: job.exit_code,
         exit_status: job.exit_status, cleanup: job.cleanup,
-        report: job.report ? { total: job.report.total,
-          passed: job.report.passed, failed: job.report.failed,
-          complete: job.report.complete } : null } };
+        // P1-1: the supervisor payload's report field is the ARRAY
+        // `job.reports` (kind-specific counters), not a singular report.
+        reports: mapJobReports(job.reports) } };
       return {
         content: [{ type: "text",
           text: JSON.stringify(payload) + (receipt.inconclusive

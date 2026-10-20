@@ -90,5 +90,5 @@
       ]
     }
   ],
-  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-cdx/admission-receipt.json"
+  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-cdx-v4/admission-receipt.json"
 }

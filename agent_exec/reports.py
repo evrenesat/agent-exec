@@ -113,17 +113,29 @@ def read_go_test_json(path: Path) -> dict:
                 "complete": False, "error": "report file is empty"}
     parsed = parse_go_test_json_stream(raw)
     counts = parsed.get("counts", parsed.get("summary", {}))
-    complete = parsed.get("integrity") == "complete" and counts.get("packages_failed", 1) == 0
+    overall = parsed.get("overall")
+    # Zero collected tests is never success: a complete stream of only
+    # no-test packages (or an empty selection) reports overall
+    # "no_tests"/"incomplete", so completion requires the parser's "passed"
+    # verdict AND at least one executed test, not merely zero failures.
+    complete = (parsed.get("integrity") == "complete"
+                and overall == "passed"
+                and counts.get("tests_executed", 0) > 0)
+    notes = ["no-test packages counted separately, never whole-project "
+             "success"] if counts.get("packages_no_tests") else []
+    if overall == "no_tests":
+        notes.append("zero tests executed: only packages without tests "
+                     "collected — incomplete required check, never success")
     return {"kind": "go-test-json", "integrity": parsed.get("integrity"),
-            "complete": complete, "bytes": len(raw),
+            "overall": overall, "complete": complete, "bytes": len(raw),
             "tests_passed": counts.get("tests_passed", 0),
             "tests_failed": counts.get("tests_failed", 0),
             "tests_skipped": counts.get("tests_skipped", 0),
+            "tests_executed": counts.get("tests_executed", 0),
             "packages_no_tests": counts.get("packages_no_tests", 0),
             "packages_cached": counts.get("packages_cached", 0),
             "failures": parsed.get("failures", [])[:10],
-            "notes": ["no-test packages counted separately, never whole-project "
-                      "success"] if counts.get("packages_no_tests") else []}
+            "notes": notes}
 
 
 def summarize(reports: list[dict]) -> dict:

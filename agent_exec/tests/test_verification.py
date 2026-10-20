@@ -41,12 +41,18 @@ class LedgerTests(unittest.TestCase):
 
     def test_complete_requires_every_check_passed(self):
         led = ledger()
-        led.observe(requirement_id="unit", job_id="j1", outcome="passed",
-                    receipt={"outcome": "passed", "cleanup": "verified_empty"})
+        led.observe_from_store(
+            FakeStoreController({
+                "j1": {"job_id": "j1", "operation_id": "aflow.web.unit",
+                       "outcome": "passed", "cleanup": "verified_empty"}}),
+            requirement_id="unit", job_id="j1")
         manifest = led.manifest()
         self.assertFalse(manifest["complete"])  # lint + visual still missing
-        led.observe(requirement_id="lint", job_id="j2", outcome="passed",
-                    receipt={"outcome": "passed", "cleanup": "verified_empty"})
+        led.observe_from_store(
+            FakeStoreController({
+                "j2": {"job_id": "j2", "operation_id": "aflow.web.lint",
+                       "outcome": "passed", "cleanup": "verified_empty"}}),
+            requirement_id="lint", job_id="j2")
         led.observe(requirement_id="visual", job_id=None, outcome="passed")
         self.assertTrue(led.manifest()["complete"])
 
@@ -291,15 +297,64 @@ class LedgerStoreBindingTests(unittest.TestCase):
                          "caller")
 
     def test_observe_remains_independent_of_store_binding(self):
-        # The existing observe() path is unchanged: manual declarations and
-        # caller-provided receipts still work exactly as before.
+        # The observe() mechanics are unchanged: manual declarations and
+        # caller-provided receipts still record exactly as before. Only the
+        # completion policy changed: a caller-supplied automated pass is
+        # completion-inert (visible with its provenance, not counted).
         led = self.store_ledger()
         entry = led.observe(requirement_id="unit", job_id="j2",
                             outcome="passed",
                             receipt={"outcome": "passed",
                                      "cleanup": "verified_empty"})
         self.assertEqual(entry.state, "passed")
-        self.assertTrue(led.manifest()["complete"])
+        manifest = led.manifest()
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(manifest["checks"]["unit"]["observed_via"], "caller")
+
+
+class ManifestProvenanceTests(unittest.TestCase):
+    """P1-3: an automated requirement counts toward manifest complete ONLY
+    on a pass whose receipt the controller itself fetched (observed_via
+    == 'store'); a caller-supplied pass stays visible but is inert."""
+
+    def setUp(self):
+        self.led = VerificationLedger(
+            [Requirement("unit", "aflow.web.unit", scope="full")])
+
+    def test_forged_caller_pass_is_visible_but_not_counted(self):
+        entry = self.led.observe(requirement_id="unit", job_id="j1",
+                                 outcome="passed",
+                                 receipt={"outcome": "passed",
+                                          "cleanup": "verified_empty"})
+        self.assertEqual(entry.state, "passed")
+        manifest = self.led.manifest()
+        self.assertFalse(manifest["complete"],
+                         "a caller-supplied automated pass must not complete")
+        check = manifest["checks"]["unit"]
+        self.assertEqual(check["state"], "passed")
+        self.assertEqual(check["observed_via"], "caller")
+        self.assertEqual(check["receipt_outcome"], "passed")
+
+    def test_store_observance_of_same_requirement_completes(self):
+        self.led.observe(requirement_id="unit", job_id="j1", outcome="passed",
+                         receipt={"outcome": "passed",
+                                  "cleanup": "verified_empty"})
+        self.assertFalse(self.led.manifest()["complete"])
+        controller = FakeStoreController({
+            "j1": {"job_id": "j1", "operation_id": "aflow.web.unit",
+                   "outcome": "passed", "cleanup": "verified_empty"}})
+        entry = self.led.observe_from_store(controller,
+                                            requirement_id="unit",
+                                            job_id="j1")
+        self.assertEqual(entry.observed_via, "store")
+        manifest = self.led.manifest()
+        self.assertTrue(manifest["complete"])
+        self.assertEqual(manifest["checks"]["unit"]["observed_via"], "store")
+
+    def test_note_documents_store_only_completion(self):
+        note = self.led.manifest()["note"]
+        self.assertIn("observed_via='store'", note)
+        self.assertIn("does not complete", note)
 
 
 class RealControllerRunningTests(unittest.TestCase):
@@ -358,8 +413,9 @@ class CrossSessionController(FakeStoreController):
 
 
 class StoreStampForgeryTests(unittest.TestCase):
-    """Round-4 review P3: observe() must refuse to stamp 'store' provenance
-    on caller-supplied receipts; only observe_from_store() may."""
+    """Round-4 review P3 / P1-4: observe() must refuse to stamp 'store'
+    provenance on caller-supplied receipts in EVERY argument shape; only
+    observe_from_store() may, via the private _record() core."""
 
     def setUp(self):
         self.led = ledger()
@@ -371,6 +427,54 @@ class StoreStampForgeryTests(unittest.TestCase):
                              receipt={"outcome": "passed",
                                       "cleanup": "verified_empty"},
                              observed_via="store")
+
+    def test_store_stamp_kwarg_no_longer_exists(self):
+        signature = inspect.signature(VerificationLedger.observe)
+        self.assertNotIn("_store_stamp", signature.parameters)
+
+    def test_forged_store_stamp_kwarg_raises(self):
+        # The old forgery shape (observed_via="store", _store_stamp=True)
+        # must fail now: the parameter is gone (TypeError) or the provenance
+        # is refused (ValueError).
+        with self.assertRaises((TypeError, ValueError)):
+            self.led.observe(requirement_id="unit", job_id="j1",
+                             outcome="passed",
+                             receipt={"outcome": "passed",
+                                      "cleanup": "verified_empty"},
+                             observed_via="store", _store_stamp=True)
+
+    def test_store_rejected_for_every_observe_argument_shape(self):
+        valid_receipt = {"outcome": "passed", "cleanup": "verified_empty"}
+        shapes = [
+            {"requirement_id": "unit", "job_id": "j1", "outcome": "passed",
+             "observed_via": "store"},
+            {"requirement_id": "unit", "job_id": "j1", "outcome": "passed",
+             "receipt": valid_receipt, "observed_via": "store"},
+            {"requirement_id": "unit", "job_id": "j1", "outcome": "passed",
+             "receipt": valid_receipt, "input_fingerprint": "abc",
+             "wall": 1.0, "observed_via": "store"},
+            {"requirement_id": "unit", "job_id": "j1", "outcome": "failed",
+             "receipt": {"outcome": "failed"}, "observed_via": "store"},
+            {"requirement_id": "unit", "job_id": None, "outcome": "running",
+             "observed_via": "store"},
+            {"requirement_id": "visual", "job_id": None, "outcome": "passed",
+             "observed_via": "store"},  # manual requirement: still refused
+        ]
+        for kwargs in shapes:
+            with self.subTest(shape=sorted(kwargs)):
+                with self.assertRaises(ValueError):
+                    self.led.observe(**kwargs)
+        # No forged attempt may leave ANY entry behind, let alone a
+        # store-stamped one.
+        self.assertNotIn("unit", self.led.entries)
+        self.assertNotIn("visual", self.led.entries)
+        self.assertFalse(any(entry.observed_via == "store"
+                             for entry in self.led.entries.values()))
+
+    def test_unknown_observed_via_still_rejected(self):
+        with self.assertRaises(ValueError):
+            self.led.observe(requirement_id="unit", job_id="j1",
+                             outcome="failed", observed_via="whisper")
 
     def test_observe_from_store_still_stamps_store(self):
         class Ctl:

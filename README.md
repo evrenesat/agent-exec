@@ -25,7 +25,7 @@ Linux with systemd ≥ 250 (cgroup v2; developed on 255), Python 3.12+, and righ
 
 ```bash
 git clone git@github.com:evrenesat/agent-exec.git && cd agent-exec
-python3 -m unittest discover -s agent_exec/tests        # 236 tests, ~10 s
+python3 -m unittest discover -s agent_exec/tests        # 255 tests, ~10 s
 python3 -m agent_exec.cli selftest --backend linux --output /tmp/exec-selftest
 ```
 

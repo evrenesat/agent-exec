@@ -28,12 +28,13 @@ def _normalize_argv(argv) -> list[str]:
 
 
 ADMISSION_IDENTITY_FIELDS = (
-    # Execution-relevant fields only: administrative fields (status,
+    # Execution-relevant fields only (reports included: parser kind and
+    # output paths affect verifiability): administrative fields (status,
     # admission_receipt, notes) may change during the documented
     # draft -> fixture_verified promotion WITHOUT invalidating the receipt.
     "profile_id", "project", "component", "operation", "host", "command",
     "selectors", "deadlines", "environment", "preparation", "inputs",
-    "capabilities", "variant_defaults", "isolation",
+    "capabilities", "variant_defaults", "isolation", "reports",
 )
 
 
