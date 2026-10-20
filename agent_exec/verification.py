@@ -67,7 +67,8 @@ class VerificationLedger:
     def observe(self, *, requirement_id: str, job_id: str | None, outcome: str,
                 receipt: dict | None = None, input_fingerprint: str | None = None,
                 wall: float | None = None,
-                observed_via: str | None = None) -> LedgerEntry:
+                observed_via: str | None = None,
+                _store_stamp: bool = False) -> LedgerEntry:
         if requirement_id not in self.requirements:
             raise KeyError(f"unknown requirement: {requirement_id!r}")
         if outcome not in STATES:
@@ -79,6 +80,12 @@ class VerificationLedger:
             observed_via = "manual" if requirement.manual else "caller"
         elif observed_via not in ("store", "caller", "manual"):
             raise ValueError(f"unknown observed_via: {observed_via!r}")
+        if observed_via == "store" and not _store_stamp:
+            # 'store' provenance is attested by observe_from_store() actually
+            # fetching the receipt from the controller; a caller cannot stamp
+            # it onto a self-supplied receipt body.
+            raise ValueError("observed_via='store' can only be set by "
+                             "observe_from_store()")
         if outcome == "passed" and not requirement.manual:
             # An automated check passes only on the strength of a trusted job
             # receipt: a real job id plus recorded pass AND verified cleanup.
@@ -181,7 +188,7 @@ class VerificationLedger:
         return self.observe(requirement_id=requirement_id, job_id=job_id,
                             outcome=state, receipt=receipt,
                             input_fingerprint=input_fingerprint,
-                            observed_via="store")
+                            observed_via="store", _store_stamp=True)
 
     def invalidate_stale(self, current_fingerprint: str | None) -> list[str]:
         """Mark passed receipts stale when the relevant inputs changed.

@@ -357,5 +357,32 @@ class CrossSessionController(FakeStoreController):
         raise RuntimeError("job belongs to a different session")
 
 
+class StoreStampForgeryTests(unittest.TestCase):
+    """Round-4 review P3: observe() must refuse to stamp 'store' provenance
+    on caller-supplied receipts; only observe_from_store() may."""
+
+    def setUp(self):
+        self.led = ledger()
+
+    def test_caller_cannot_stamp_store_provenance(self):
+        with self.assertRaises(ValueError):
+            self.led.observe(requirement_id="unit", job_id="j1",
+                             outcome="passed",
+                             receipt={"outcome": "passed",
+                                      "cleanup": "verified_empty"},
+                             observed_via="store")
+
+    def test_observe_from_store_still_stamps_store(self):
+        class Ctl:
+            def status(self, job_id):
+                return {"job_id": job_id, "operation_id": "aflow.web.unit",
+                        "outcome": "passed", "cleanup": "verified_empty"}
+        entry = self.led.observe_from_store(Ctl(), requirement_id="unit",
+                                            job_id="j1")
+        self.assertEqual(entry.observed_via, "store")
+        self.assertEqual(
+            self.led.manifest()["checks"]["unit"]["observed_via"], "store")
+
+
 if __name__ == "__main__":
     unittest.main()
