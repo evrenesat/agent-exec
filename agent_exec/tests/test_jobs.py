@@ -29,7 +29,9 @@ class FakeBackend:
     def __init__(self):
         self.units: dict[str, dict] = {}
         self.launch_calls: list[str] = []
+        self.stop_calls: list[str] = []
         self.fail_next_launch = False
+        self.fail_after_create = False
         self.manager_down = False
         self.log_entries = [{"cursor": "c1", "message": "line one",
                              "monotonic_ts": "1"}]
@@ -43,6 +45,9 @@ class FakeBackend:
         self.units[unit] = {"phase": "running", "record": None,
                             "cgroup": "failed", "collected": False,
                             "stop_signal": None}
+        if self.fail_after_create:
+            self.fail_after_create = False
+            raise RuntimeError("simulated failure after unit creation")
         return {"unit": unit, "launch_wall": 1.0, "boot_id": "fake-boot",
                 "invocation_id": "fake-invocation", "launch_argv": ["x"]}
 
@@ -97,6 +102,7 @@ class FakeBackend:
 
     def stop(self, spec, kill=False):
         unit = linux_jobs.unit_name(spec.job_id)
+        self.stop_calls.append(unit)
         self.units[unit]["stop_signal"] = "SIGKILL" if kill else "TERM"
         self.set_terminal(spec, {"service_result": "signal", "exit_code": "killed",
                                  "exit_status": "TERM" if not kill else "KILL"})
@@ -618,6 +624,264 @@ class LogPaginationTests(unittest.TestCase):
         self.assertEqual([e["cursor"] for e in result["entries"]],
                          ["c1", "c2", "c3"])
         self.assertTrue(any("oversized" in e["message"] for e in result["entries"]))
+
+    def test_window_cap_sets_explicit_gap(self):
+        # Regression: journalctl -n 512 returns only the newest entries, so a
+        # full window must surface an explicit gap instead of "gap": None
+        # (entries older than the window were silently unread).
+        lines = [json.dumps({"__CURSOR": f"c{index}", "MESSAGE": f"m{index}",
+                             "__MONOTONIC_TIMESTAMP": str(index)})
+                 for index in range(linux_jobs.JOURNAL_ENTRY_CAP + 1)]
+        self.fake_journal("\n".join(lines) + "\n")
+        result = linux_jobs.read_logs(self.spec, max_bytes=10_000_000)
+        self.assertIsNotNone(result["gap"])
+        self.assertIn("cap", result["gap"])
+        self.assertIn(str(linux_jobs.JOURNAL_ENTRY_CAP), result["gap"])
+
+    def test_window_below_cap_has_no_gap(self):
+        lines = [json.dumps({"__CURSOR": f"c{index}", "MESSAGE": f"m{index}",
+                             "__MONOTONIC_TIMESTAMP": str(index)})
+                 for index in range(5)]
+        self.fake_journal("\n".join(lines) + "\n")
+        result = linux_jobs.read_logs(self.spec, max_bytes=10_000_000)
+        self.assertEqual(len(result["entries"]), 5)
+        self.assertIsNone(result["gap"])
+
+class AdoptionHookBackend(FakeBackend):
+    """FakeBackend that can run a hook inside launch() just before the
+    simulated failure: used to land a concurrent adoption between the row
+    reservation and the launch exception."""
+
+    def __init__(self):
+        super().__init__()
+        self.pre_fail_hook = None
+
+    def launch(self, spec):
+        if self.fail_next_launch and self.pre_fail_hook is not None:
+            hook, self.pre_fail_hook = self.pre_fail_hook, None
+            hook()
+        return super().launch(spec)
+
+
+class ForcedInconclusiveBackend(FakeBackend):
+    """inspect always reports an inconclusive observation whose unit has NOT
+    definitively ended (ended=False). A phase-"inconclusive" observation
+    normally implies ended=True (absorbed by an earlier reconcile branch),
+    so this is the only way to drive the cancel_requested inconclusive
+    branch. `before_inspect` optionally runs just before observing,
+    simulating a concurrent writer between reconcile's top-of-function
+    terminal check and the branch itself."""
+
+    def __init__(self):
+        super().__init__()
+        self.before_inspect = None
+
+    def inspect(self, spec):
+        if self.before_inspect is not None:
+            hook, self.before_inspect = self.before_inspect, None
+            hook()
+        observation = super().inspect(spec)
+        observation["phase"] = "inconclusive"
+        observation["ended"] = False
+        observation["warning"] = "forced inconclusive observation (branch test)"
+        return observation
+
+
+class LaunchExceptionDisciplineTests(unittest.TestCase):
+    """Review P2: a backend.launch exception must mirror the claimed=False
+    discipline — never finalize a row another writer adopted, stop an
+    orphaned unit it created, and never revert a running row to blocked."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = AdoptionHookBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "evidence",
+                                        session_id="session-A",
+                                        backend=self.backend)
+
+    def tearDown(self):
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def test_case_a_fail_before_creation_blocks_without_stop(self):
+        self.backend.fail_next_launch = True
+        with self.assertRaises(JobError):
+            self.controller.launch(["/bin/true"], request_id="pre",
+                                   operation_id="op")
+        row = self.controller.store.find_by_request("session-A", "pre")
+        self.assertEqual(row["state"], "completed")
+        self.assertEqual(row["outcome"], "blocked")
+        self.assertEqual(self.backend.stop_calls, [])
+
+    def test_case_b_fail_after_creation_blocks_and_stops_orphan(self):
+        self.backend.fail_after_create = True
+        with self.assertRaises(JobError):
+            self.controller.launch(["/bin/true"], request_id="orphan",
+                                   operation_id="op")
+        row = self.controller.store.find_by_request("session-A", "orphan")
+        self.assertEqual(row["state"], "completed")
+        self.assertEqual(row["outcome"], "blocked")
+        self.assertIn(linux_jobs.unit_name(row["job_id"]),
+                      self.backend.stop_calls,
+                      "the unowned unit created before the failure must be stopped")
+
+    def test_case_c_adopted_row_is_never_finalized_by_launch_error(self):
+        holder = {}
+
+        def adopt_during_launch():
+            row = self.controller.store.find_by_request("session-A", "c3")
+            holder["job_id"] = row["job_id"]
+            self.controller.store.update_job(
+                row["job_id"], unit=linux_jobs.unit_name(row["job_id"]),
+                state="running")
+
+        self.backend.fail_next_launch = True
+        self.backend.pre_fail_hook = adopt_during_launch
+        with self.assertRaises(JobError):
+            self.controller.launch(["/bin/true"], request_id="c3",
+                                   operation_id="op")
+        row = self.controller.store.get_job(holder["job_id"])
+        self.assertEqual(row["state"], "running",
+                         "an adopted row must not be finalized by the launch error")
+        self.assertIsNone(row["outcome"])
+        self.assertTrue(row["unit"].endswith(".service"))
+        kinds = [event["kind"]
+                 for event in self.controller.store.events_after(holder["job_id"])]
+        self.assertIn("launch_error_after_adoption", kinds)
+        self.assertNotIn("terminal", kinds)
+        self.assertEqual(self.backend.stop_calls, [])
+
+
+class ReconcileCancelCasTests(unittest.TestCase):
+    """Review P2: the cancel_requested inconclusive finalize in reconcile()
+    must be a CAS — an already-terminal row keeps its existing receipt."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "evidence",
+                                        session_id="session-A",
+                                        backend=self.backend)
+
+    def tearDown(self):
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def test_reconcile_after_cancelled_collection_is_idempotent(self):
+        job = self.controller.launch(["/bin/true"], request_id="crc",
+                                     operation_id="op")["job_id"]
+        self.controller.cancel(job, reason="test")
+        spec = self.controller._spec_for(self.controller.store.get_job(job))
+        unit = linux_jobs.unit_name(spec.job_id)
+        # Collection lost the exit record: inconclusive evidence only.
+        self.backend.units[unit].update({"collected": True, "record": None})
+        first = self.controller.reconcile(job)
+        self.assertTrue(first["reconciled"])
+        self.assertEqual(first["receipt"]["outcome"], "inconclusive")
+        second = self.controller.reconcile(job)
+        self.assertEqual(second["receipt"], first["receipt"],
+                         "a second reconcile must not overwrite the receipt")
+        self.assertFalse(second["reconciled"])
+
+    def test_cancel_inconclusive_branch_uses_cas(self):
+        backend = ForcedInconclusiveBackend()
+        controller = JobController(self.root / "store-b1.sqlite",
+                                   evidence_root=self.root / "evidence-b1",
+                                   session_id="session-A", backend=backend)
+        try:
+            job = controller.launch(["/bin/true"], request_id="cb1",
+                                    operation_id="op")["job_id"]
+            controller.cancel(job, reason="test")
+            result = controller.reconcile(job)
+            self.assertTrue(result["reconciled"])
+            self.assertEqual(result["receipt"]["outcome"], "inconclusive")
+            row = controller.store.get_job(job)
+            self.assertEqual(row["state"], "completed")
+        finally:
+            controller.close()
+
+    def test_cancel_inconclusive_branch_never_overwrites_terminal(self):
+        backend = ForcedInconclusiveBackend()
+        controller = JobController(self.root / "store-b2.sqlite",
+                                   evidence_root=self.root / "evidence-b2",
+                                   session_id="session-A", backend=backend)
+        try:
+            job = controller.launch(["/bin/true"], request_id="cb2",
+                                    operation_id="op")["job_id"]
+            controller.cancel(job, reason="test")
+            concurrent = {"wall": time.time()}
+
+            def concurrent_writer():
+                concurrent["wall"] = time.time()
+                controller.store.update_job(job, state="completed",
+                                            outcome="cancelled",
+                                            terminal_wall=concurrent["wall"])
+
+            backend.before_inspect = concurrent_writer
+            result = controller.reconcile(job)
+            self.assertTrue(result["reconciled"])
+            self.assertEqual(result["receipt"]["outcome"], "cancelled",
+                             "the concurrent terminal receipt must stand")
+            self.assertEqual(result["receipt"]["terminal_wall"],
+                             concurrent["wall"])
+        finally:
+            controller.close()
+
+
+class CgroupStateTests(unittest.TestCase):
+    """Review P2: unreadable cgroup evidence must be "unknown", never a
+    quiet "verified_empty" (Path.exists() is False on EACCES too)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original_root = linux_jobs.CGROUP_ROOT
+        linux_jobs.CGROUP_ROOT = Path(self.tmp.name)
+
+    def tearDown(self):
+        linux_jobs.CGROUP_ROOT = self.original_root
+        self.tmp.cleanup()
+
+    def test_absent_unit_is_verified_empty(self):
+        self.assertEqual(linux_jobs.cgroup_state("xtx-exec-absent.service"),
+                         "verified_empty")
+
+    def test_present_dir_without_events_is_unknown(self):
+        unit = "xtx-exec-noevents.service"
+        (linux_jobs.CGROUP_ROOT / unit).mkdir(parents=True)
+        self.assertEqual(linux_jobs.cgroup_state(unit), "unknown")
+
+    def test_populated_zero_with_empty_procs_is_verified_empty(self):
+        unit = "xtx-exec-clean.service"
+        cgroup = linux_jobs.CGROUP_ROOT / unit
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.events").write_text("populated 0\n")
+        (cgroup / "cgroup.procs").write_text("")
+        self.assertEqual(linux_jobs.cgroup_state(unit), "verified_empty")
+
+    def test_populated_one_is_failed(self):
+        unit = "xtx-exec-busy.service"
+        cgroup = linux_jobs.CGROUP_ROOT / unit
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.events").write_text("populated 1\n")
+        self.assertEqual(linux_jobs.cgroup_state(unit), "failed")
+
+    def test_unreadable_path_is_unknown_not_verified_empty(self):
+        # Regression shape for the EACCES bug: when the unit path cannot be
+        # stat-ed (here ENOTDIR because the cgroup root is a file), the old
+        # exists()-check returned verified_empty; it must be unknown.
+        fake_root = linux_jobs.CGROUP_ROOT / "root-file"
+        fake_root.write_text("not a directory")
+        linux_jobs.CGROUP_ROOT = fake_root
+        self.assertEqual(linux_jobs.cgroup_state("xtx-exec-eacces.service"),
+                         "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

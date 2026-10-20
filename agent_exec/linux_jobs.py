@@ -17,6 +17,7 @@ module-level `_run` function, which tests may replace with a fake.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -133,12 +134,19 @@ def cgroup_state(unit: str) -> str:
     Uses cgroup.events `populated`, which includes descendant cgroups: an
     empty unit cgroup.procs with a populated child is NOT clean (a process
     can hide in a nested cgroup). Unreadable evidence is unknown, never a
-    quiet pass.
+    quiet pass: absence is decided with os.stat so that FileNotFoundError
+    (the unit cgroup is gone) is distinct from PermissionError/OSError
+    (evidence exists but cannot be read — Path.exists() reports False for
+    both and would turn an unreadable cgroup into a quiet pass).
     """
     cgroup = CGROUP_ROOT / unit
     try:
-        if not cgroup.exists():
-            return "verified_empty"
+        os.stat(cgroup)
+    except FileNotFoundError:
+        return "verified_empty"
+    except OSError:
+        return "unknown"
+    try:
         events = (cgroup / "cgroup.events").read_text().split()
         populated = None
         for index, token in enumerate(events):
@@ -269,7 +277,14 @@ def stop(spec: JobSpec, *, kill: bool = False) -> dict:
 
 def read_logs(spec: JobSpec, *, after_cursor: str | None = None,
               max_bytes: int = 32768) -> dict:
-    """Bounded journal read with cursor replay; committed entries only."""
+    """Bounded journal read with cursor replay; committed entries only.
+
+    journalctl is asked for at most JOURNAL_ENTRY_CAP entries. When that many
+    candidate entries are processed, the read returns an explicit "gap"
+    message: entries older than the returned window may exist and were not
+    read. A gap-free result is complete evidence for the requested unit;
+    a capped one is not (the CLI treats any gap as a failed log check).
+    """
     unit = unit_name(spec.job_id)
     argv = ["journalctl", "-q", "-u", unit, "-o", "json", "--no-pager",
             "-n", str(JOURNAL_ENTRY_CAP)]
@@ -288,6 +303,7 @@ def read_logs(spec: JobSpec, *, after_cursor: str | None = None,
     truncated = False
     oversized = 0
     next_cursor = after_cursor
+    processed = 0
     for line in out.stdout.splitlines():
         if not line.startswith("{"):
             continue
@@ -295,6 +311,7 @@ def read_logs(spec: JobSpec, *, after_cursor: str | None = None,
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
+        processed += 1
         cursor = entry.get("__CURSOR")
         size = len(line) + 1
         if size > max_bytes:
@@ -318,9 +335,15 @@ def read_logs(spec: JobSpec, *, after_cursor: str | None = None,
             next_cursor = cursor
         entries.append({"cursor": cursor, "message": entry.get("MESSAGE", ""),
                         "monotonic_ts": entry.get("__MONOTONIC_TIMESTAMP")})
+    # journalctl -n only returns the newest N entries: a full window means
+    # older entries may exist and were silently outside this read.
+    gap = None
+    if processed >= JOURNAL_ENTRY_CAP:
+        gap = (f"window cap reached ({JOURNAL_ENTRY_CAP} journal entries): "
+               "entries older than the returned window may exist")
     return {"entries": entries, "next_cursor": next_cursor, "bytes": used,
             "truncated": truncated, "oversized_entries": oversized,
-            "gap": None,
+            "gap": gap,
             "note": "cursor advances only past accepted entries; re-read "
                     "with a larger max_bytes to retrieve skipped ones"}
 

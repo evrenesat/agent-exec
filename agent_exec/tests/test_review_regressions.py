@@ -1,11 +1,13 @@
 """Regression tests for independent-review findings (P0-2, P0-4, P1-2).
 
 P0-2: the CK3 driver (agent_exec/harness/opencode/run_real_validation.py)
-generates its operation configuration inline in main() and launches the model
-without ever proving the operation passes supervisor configuration validation.
-These tests pin the corrected shape: a scored, source-root-bound operation
-validates against the REAL aflow-web-p100 profile before any backend launch,
-and the driver's original missing-source_root shape is rejected.
+builds its operation configuration in build_operations(); these tests launch
+the driver's OWN dict — imported verbatim, never mirrored or hand-corrected —
+through a real Supervisor with the REAL agent_exec/profiles directory, so the
+scored, source-root-bound operation validates against the admitted
+aflow-web-p100 profile before any backend launch. The historical broken shape
+(a scored profile-bound operation without source_root, plus raw argv/cwd that
+the supervisor rejects) is pinned as rejected.
 
 P0-4: profile-bound operations must take their working directory from the
 profile render (including {source_root}/subpath templates), not from the
@@ -25,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
@@ -102,9 +105,10 @@ def write_legacy_receipt(path: Path, *, profile_id: str, source_root: str,
 
 
 class ReviewP0_2DriverOperationTests(unittest.TestCase):
-    """The driver's generated operation configuration must pass supervisor
+    """The driver's OWN build_operations() output must pass supervisor
     configuration validation (admission + source binding + profile render)
-    BEFORE the model session starts; a missing source_root is rejected."""
+    BEFORE the model session starts; the historical broken shape (a scored
+    profile-bound operation without source_root) is rejected."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -117,40 +121,34 @@ class ReviewP0_2DriverOperationTests(unittest.TestCase):
                                         session_id="drv-session",
                                         backend=self.backend)
         self.profiles_dir = HERE.parent / "profiles"  # the real profiles dir
+        self.session_home = self.root / "home"
 
     def tearDown(self):
         self.controller.close()
         self.tmp.cleanup()
 
-    def driver_operation(self):
-        """MIRROR of the operations dict built inline in run_real_validation.py
-        main() (constants imported from the driver module; if the driver
-        changes, this must change with it). The driver literal also embeds raw
-        npm argv plus cwd; a scored profile-bound operation must not carry raw
-        argv (supervisor.py rejects argv+scored by design) and the admitted
-        profile owns both command and cwd, so the scored config keeps the
-        driver's profile_id/deadline/env values and adds the owned source root.
-        """
-        return {
-            "aflow.web.unit": {
-                "cwd": run_real_validation.SOURCE,
-                "deadline_seconds": 180,
-                "profile_id": "aflow-web-p100",
-                "env": {"PATH": (f"{run_real_validation.NODE_BIN}:/usr/local/bin"
-                                 ":/usr/bin:/bin"),
-                        "npm_config_audit": "false", "npm_config_fund": "false",
-                        "NO_COLOR": "1"},
-                "scored": True,
-                "source_root": run_real_validation.SOURCE,
-            },
-        }
+    def driver_operations(self):
+        """The driver's dict VERBATIM: build_operations() is imported and
+        called with a session home — no mirror, no hand corrections."""
+        return run_real_validation.build_operations(self.session_home)
 
     def make_supervisor(self, operations):
         return Supervisor(self.controller, operations,
                           profiles_dir=self.profiles_dir)
 
+    def test_driver_operation_is_scored_profile_bound_shape(self):
+        spec = self.driver_operations()["aflow.web.unit"]
+        # No raw argv and no cwd: the admitted profile renders both.
+        self.assertNotIn("argv", spec)
+        self.assertNotIn("cwd", spec)
+        self.assertTrue(spec["scored"])
+        self.assertEqual(spec["profile_id"], "aflow-web-p100")
+        self.assertEqual(spec["source_root"], run_real_validation.SOURCE)
+        self.assertEqual(spec["deadline_seconds"], 180)
+        self.assertEqual(spec["env"]["HOME"], str(self.session_home))
+
     def test_driver_operation_validates_and_renders_profile_command(self):
-        supervisor = self.make_supervisor(self.driver_operation())
+        supervisor = self.make_supervisor(self.driver_operations())
         result = supervisor.launch({"operation": "aflow.web.unit",
                                     "request_id": "drvcheck"})
         self.assertEqual(result["command_origin"], "admitted:aflow-web-p100")
@@ -158,7 +156,7 @@ class ReviewP0_2DriverOperationTests(unittest.TestCase):
         spec = self.controller.backend.launch_calls[-1]
         # argv matches the admitted profile render: npm test flags for the
         # one-worker forks pool, with the per-job report path inside the
-        # evidence root (never the driver's literal NODE_BIN-prefixed argv).
+        # evidence root (never the driver's literal argv — it has none).
         argv = list(spec.argv)
         self.assertEqual(argv[0], "npm")
         for flag in ("test", "--run", "--maxWorkers=1", "--minWorkers=1",
@@ -173,9 +171,14 @@ class ReviewP0_2DriverOperationTests(unittest.TestCase):
         # Deadline comes from the admitted profile (hard_seconds 180).
         self.assertEqual(spec.deadline_seconds, 180)
 
-    def test_driver_operation_without_source_root_rejected_before_launch(self):
-        operations = self.driver_operation()
-        del operations["aflow.web.unit"]["source_root"]  # the driver's bug
+    def test_historical_broken_shape_without_source_root_rejected(self):
+        """The historical broken shape: the driver once emitted this operation
+        with raw argv + cwd and NO source_root, so the supervisor — which
+        requires source_root for profile-bound operations — rejected it and
+        the driver could never launch. A copy of build_operations' dict with
+        source_root deleted must still be rejected before any backend launch."""
+        operations = run_real_validation.build_operations(self.session_home)
+        del operations["aflow.web.unit"]["source_root"]  # the historical bug
         supervisor = self.make_supervisor(operations)
         with self.assertRaises(JobError) as caught:
             supervisor.launch({"operation": "aflow.web.unit",
@@ -184,6 +187,62 @@ class ReviewP0_2DriverOperationTests(unittest.TestCase):
         # Nothing reached the backend: the model must never start on an
         # operation that fails configuration validation.
         self.assertEqual(len(self.controller.backend.launch_calls), 0)
+
+
+class SupervisorMainArgparseTests(unittest.TestCase):
+    """supervisor.main() must accept --profiles-dir and forward it to the
+    Supervisor. Parse_args level only: controller, supervisor construction is
+    real but the HTTP server is faked, so nothing binds or starts."""
+
+    def run_main(self, extra_args):
+        from agent_exec.harness.opencode import supervisor as supervisor_module
+
+        class FakeController:
+            def close(self):
+                pass
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.server_port = 0  # main reads it for the startup line
+
+            def serve_forever(self):
+                raise KeyboardInterrupt  # leave main() before any real serving
+
+            def server_close(self):
+                pass
+
+        captured = {}
+        real_supervisor = supervisor_module.Supervisor
+
+        def recording_supervisor(controller, operations, token=None,
+                                 profiles_dir=None):
+            captured["profiles_dir"] = profiles_dir
+            return real_supervisor(controller, operations, token=token,
+                                   profiles_dir=profiles_dir)
+
+        argv = ["supervisor.py", "--store", "unused.sqlite",
+                "--evidence-root", "unused-evidence", *extra_args]
+        with mock.patch("sys.argv", argv), \
+                mock.patch.object(supervisor_module, "JobController",
+                                  lambda *a, **k: FakeController()), \
+                mock.patch.object(supervisor_module, "Supervisor",
+                                  recording_supervisor), \
+                mock.patch.object(supervisor_module, "ThreadingHTTPServer",
+                                  FakeServer), \
+                mock.patch("builtins.print"):
+            exit_code = supervisor_module.main()
+        return exit_code, captured
+
+    def test_profiles_dir_flag_is_parsed_and_forwarded(self):
+        exit_code, captured = self.run_main(
+            ["--profiles-dir", "/tmp/some-profiles"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["profiles_dir"], Path("/tmp/some-profiles"))
+
+    def test_profiles_dir_defaults_to_none_when_omitted(self):
+        exit_code, captured = self.run_main([])
+        self.assertEqual(exit_code, 0)
+        self.assertIsNone(captured["profiles_dir"])
 
 
 class ReviewP0_4ProfileCwdTests(unittest.TestCase):

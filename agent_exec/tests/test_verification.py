@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import inspect
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
 
+from agent_exec.jobs import JobController  # noqa: E402
+from agent_exec.tests.test_jobs import FakeBackend  # noqa: E402
 from agent_exec.verification import (  # noqa: E402
     LedgerEntry, Requirement, VerificationLedger)
 
@@ -127,6 +130,13 @@ class ReceiptDerivedPassTests(unittest.TestCase):
         self.led.observe(requirement_id="visual", job_id=None, outcome="passed")
         self.assertEqual(self.led.manifest()["checks"]["visual"]["state"], "passed")
 
+    def test_manual_declaration_marks_observed_via_manual(self):
+        entry = self.led.observe(requirement_id="visual", job_id=None,
+                                 outcome="passed")
+        self.assertEqual(entry.observed_via, "manual")
+        check = self.led.manifest()["checks"]["visual"]
+        self.assertEqual(check["observed_via"], "manual")
+
 
 class LedgerOperationBindingTests(unittest.TestCase):
     """P1-3 round 2: receipts must belong to the requirement's operation."""
@@ -175,9 +185,11 @@ class LedgerStoreBindingTests(unittest.TestCase):
         self.assertTrue(led.manifest()["complete"])
 
     def test_running_store_status_maps_to_running(self):
+        # REAL running shape from JobController.status(): only
+        # job_id/state/phase/unit — no operation_id, no outcome.
         controller = FakeStoreController({
-            "j1": {"job_id": "j1", "operation_id": "aflow.web.unit",
-                   "state": "running", "phase": "running", "unit": "u1"}})
+            "j1": {"job_id": "j1", "state": "running",
+                   "phase": "running", "unit": "u1"}})
         led = self.store_ledger()
         entry = led.observe_from_store(controller, requirement_id="unit",
                                        job_id="j1")
@@ -257,6 +269,27 @@ class LedgerStoreBindingTests(unittest.TestCase):
                 receipt={"outcome": "passed",
                          "cleanup": "verified_empty"})
 
+    def test_store_pass_marks_observed_via_store_in_manifest(self):
+        controller = FakeStoreController({"j1": self.store_receipt()})
+        led = self.store_ledger()
+        entry = led.observe_from_store(controller, requirement_id="unit",
+                                       job_id="j1")
+        self.assertEqual(entry.observed_via, "store")
+        self.assertEqual(led.manifest()["checks"]["unit"]["observed_via"],
+                         "store")
+
+    def test_caller_pass_is_distinguishable_from_store_pass(self):
+        led = self.store_ledger()
+        entry = led.observe(requirement_id="unit", job_id="j2",
+                            outcome="passed",
+                            receipt={"outcome": "passed",
+                                     "cleanup": "verified_empty"})
+        # Caller-bound automated provenance is visible so a reviewer can
+        # treat it as unverified and demand store re-observation.
+        self.assertEqual(entry.observed_via, "caller")
+        self.assertEqual(led.manifest()["checks"]["unit"]["observed_via"],
+                         "caller")
+
     def test_observe_remains_independent_of_store_binding(self):
         # The existing observe() path is unchanged: manual declarations and
         # caller-provided receipts still work exactly as before.
@@ -267,6 +300,40 @@ class LedgerStoreBindingTests(unittest.TestCase):
                                      "cleanup": "verified_empty"})
         self.assertEqual(entry.state, "passed")
         self.assertTrue(led.manifest()["complete"])
+
+
+class RealControllerRunningTests(unittest.TestCase):
+    """Round-3 P1: the REAL JobController running payload (which carries no
+    operation_id) must observe as running, not raise a spurious
+    operation-mismatch ValueError like the old fake masked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.backend = FakeBackend()
+        self.controller = JobController(self.root / "store.sqlite",
+                                        evidence_root=self.root / "evidence",
+                                        backend=self.backend)
+
+    def tearDown(self):
+        self.controller.close()
+        self.tmp.cleanup()
+
+    def test_live_job_observed_running_without_operation_id(self):
+        launched = self.controller.launch(["/bin/true"], request_id="r1",
+                                          operation_id="aflow.web.unit")
+        self.assertFalse(launched["replayed"])
+        led = VerificationLedger(
+            [Requirement("unit", "aflow.web.unit", scope="full")])
+        entry = led.observe_from_store(self.controller,
+                                       requirement_id="unit",
+                                       job_id=launched["job_id"])
+        self.assertEqual(entry.state, "running")
+        self.assertEqual(entry.observed_via, "store")
+        self.assertNotIn("operation_id", entry.receipt)
+        manifest = led.manifest()
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(manifest["checks"]["unit"]["state"], "running")
 
 
 class FakeStoreController:

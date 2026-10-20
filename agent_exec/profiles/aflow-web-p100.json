@@ -5,7 +5,7 @@
   "component": "web",
   "operation": "unit",
   "status": "fixture_verified",
-  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-aflow-web/admission-receipt.json",
+  "admission_receipt": "/var/lib/xtx-benchmarks/execution-layer-20261013/admission-aflow-web-v2/admission-receipt.json",
   "host": {
     "hostname": "codex",
     "os": "linux",
@@ -17,25 +17,46 @@
     "task_state_reference": "9d89c980839c83fe322c11d9591e127ceeb02f1c"
   },
   "environment": {
-    "node": {"path": "/opt/node-v24.20.0-linux-x64/bin/node", "version": "v24.20.0"},
+    "node": {
+      "path": "/opt/node-v24.20.0-linux-x64/bin/node",
+      "version": "v24.20.0"
+    },
     "package_manager": "npm",
     "lockfile": "apps/aflow_app/web/package-lock.json",
-    "vitest": {"spec": "^1.0.0", "locked": "1.6.1",
-               "forbidden_flags": ["--singleFork"],
-               "forbidden_config": ["poolOptions.forks.singleFork"],
-               "reason": "singleFork changes isolation and is only a config-level option on 1.6.1 (the CLI flag fails fast with CACError); only isolated one-worker forks are admitted for this profile"}
+    "vitest": {
+      "spec": "^1.0.0",
+      "locked": "1.6.1",
+      "forbidden_flags": [
+        "--singleFork"
+      ],
+      "forbidden_config": [
+        "poolOptions.forks.singleFork"
+      ],
+      "reason": "singleFork changes isolation and is only a config-level option on 1.6.1 (the CLI flag fails fast with CACError); only isolated one-worker forks are admitted for this profile"
+    }
   },
   "command": {
     "argv_template": [
-      "npm", "--prefix", "apps/aflow_app/web", "test", "--", "--run",
-      "--maxWorkers=1", "--minWorkers=1", "--pool=forks",
-      "--reporter=json", "--outputFile={report_dir}/vitest-json.json"
+      "npm",
+      "--prefix",
+      "apps/aflow_app/web",
+      "test",
+      "--",
+      "--run",
+      "--maxWorkers=1",
+      "--minWorkers=1",
+      "--pool=forks",
+      "--reporter=json",
+      "--outputFile={report_dir}/vitest-json.json"
     ],
     "cwd": "{source_root}",
     "selectors": "appended after the template as separate argv elements (vitest filename filters)"
   },
   "selectors": {
-    "allowed_kinds": ["file", "directory"],
+    "allowed_kinds": [
+      "file",
+      "directory"
+    ],
     "base": "apps/aflow_app/web/src",
     "note": "empty selection means the full suite; zero collected tests is an incomplete required check, never success"
   },
@@ -48,12 +69,18 @@
         "apps/aflow_app/web/src/generated/changelog.json",
         "CHANGELOG.md"
       ],
-      "inputs": ["DEVLOG.md"],
+      "inputs": [
+        "DEVLOG.md"
+      ],
       "authority": "npm owns the lifecycle; the job layer verifies generated outputs exist afterward and never runs the generator a second time"
     }
   ],
   "reports": [
-    {"kind": "vitest-json", "path_template": "{report_dir}/vitest-json.json", "admitted": false}
+    {
+      "kind": "vitest-json",
+      "path_template": "{report_dir}/vitest-json.json",
+      "admitted": false
+    }
   ],
   "deadlines": {
     "diagnose_seconds": 60,
@@ -79,21 +106,34 @@
       "apps/aflow_app/web/src/generated/changelog.json",
       "CHANGELOG.md"
     ],
-    "excluded_outputs": ["apps/aflow_app/web/node_modules", "apps/aflow_app/web/dist"]
+    "excluded_outputs": [
+      "apps/aflow_app/web/node_modules",
+      "apps/aflow_app/web/dist"
+    ]
   },
   "capabilities": {
-    "supports_coalescing": {"enabled": false,
-      "reason": "disabled for the first slice by plan; exact in-flight coalescing is a later admitted feature"},
-    "supports_reuse": {"enabled": false,
-      "reason": "completed-pass reuse off until determinism and mutation fixtures pass"},
-    "supports_incremental_report": {"enabled": false,
-      "reason": "final vitest JSON report only; incremental JSONL events need separate admission"},
-    "requires_external_state": {"enabled": false,
-      "reason": "unit tests are offline; browser/server operations are separate profiles"},
+    "supports_coalescing": {
+      "enabled": false,
+      "reason": "disabled for the first slice by plan; exact in-flight coalescing is a later admitted feature"
+    },
+    "supports_reuse": {
+      "enabled": false,
+      "reason": "completed-pass reuse off until determinism and mutation fixtures pass"
+    },
+    "supports_incremental_report": {
+      "enabled": false,
+      "reason": "final vitest JSON report only; incremental JSONL events need separate admission"
+    },
+    "requires_external_state": {
+      "enabled": false,
+      "reason": "unit tests are offline; browser/server operations are separate profiles"
+    },
     "needs_private_host": false
   },
   "variant_defaults": {
-    "default": {"note": "canonical isolated one-worker forks"}
+    "default": {
+      "note": "canonical isolated one-worker forks"
+    }
   },
   "notes": [
     "profile lifecycle authority stays with npm; the supervisor never bypasses pretest",

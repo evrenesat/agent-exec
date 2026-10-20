@@ -92,13 +92,49 @@ class JobController:
         try:
             meta = self.backend.launch(spec)
         except Exception as error:
-            # CAS: only finalize if no other writer already did.
-            self.store.update_job_if_state(job_id, ("starting", "queued", "running"),
-                                           state="completed", outcome="blocked",
-                                           terminal_wall=time.time(),
-                                           exit_record_json=None)
-            self.store.record_event(job_id, "terminal",
-                                    {"outcome": "blocked", "error": str(error)[:300]})
+            row_now = self.store.get_job(job_id)
+            if row_now is not None and row_now["unit"] != "(unlaunched)":
+                # Another writer already stored/adopted a unit for this row
+                # (e.g. a concurrent reconcile adoption): the unit is owned
+                # by the journal. Do NOT finalize, do NOT stop it, and do
+                # not clobber the adopted state — surface the launch error.
+                self.store.record_event(job_id, "launch_error_after_adoption",
+                                        {"error": str(error)[:300],
+                                         "unit": row_now["unit"]})
+                raise JobError(f"launch failed: {error}") from error
+            # The row still points at no unit. The launch reported failure,
+            # but it may have created the deterministic unit before raising:
+            # probe it. A unit that exists (or demonstrably ended with an
+            # exit record) is unowned — stop it best-effort. A not-found
+            # unit without a record is indistinguishable from never-launched
+            # and needs no stop.
+            probe = self._spec_for(row_now) if row_now is not None else None
+            unit_seen = False
+            if probe is not None:
+                try:
+                    observation = self.backend.inspect(probe)
+                except Exception:  # noqa: BLE001 — probe failure must not mask the launch error
+                    observation = None
+                if observation:
+                    unit_seen = (
+                        observation.get("phase") in ("running", "starting",
+                                                     "finishing", "terminal")
+                        or (observation.get("ended")
+                            and observation.get("exit_record") is not None))
+            if unit_seen:
+                try:
+                    self.backend.stop(probe)
+                except Exception:  # noqa: BLE001 — best-effort orphan cleanup
+                    pass
+            # CAS strictly from pre-launch states: a row already moved to
+            # "running" by another writer is never reverted to blocked.
+            if self.store.update_job_if_state(
+                    job_id, ("starting", "queued"), state="completed",
+                    outcome="blocked", terminal_wall=time.time(),
+                    exit_record_json=None):
+                self.store.record_event(job_id, "terminal",
+                                        {"outcome": "blocked",
+                                         "error": str(error)[:300]})
             raise JobError(f"launch failed: {error}") from error
         # Persist the launch argv WITHOUT environment values: the journal is
         # not a secret store, and reconcile does not need them.
@@ -394,11 +430,15 @@ class JobController:
             return {"reconciled": True, "receipt":
                     self._finalize_inconclusive(job_id, observation)}
         if row["cancel_requested"] and observation.get("phase") == "inconclusive":
-            self.store.update_job(job_id, state="completed", outcome="inconclusive",
-                                  cleanup=observation.get("cgroup", "unknown"),
-                                  terminal_wall=time.time())
-            self.store.record_event(job_id, "reconciled",
-                                    {"outcome": "inconclusive"})
+            # CAS: a concurrent writer may have finalized this row terminal
+            # while we observed; never overwrite an existing receipt.
+            if self.store.update_job_if_state(
+                    job_id, ("starting", "queued", "running"),
+                    state="completed", outcome="inconclusive",
+                    cleanup=observation.get("cgroup", "unknown"),
+                    terminal_wall=time.time()):
+                self.store.record_event(job_id, "reconciled",
+                                        {"outcome": "inconclusive"})
             return {"reconciled": True, "receipt": self._receipt(self.store.get_job(job_id))}
         self.store.record_event(job_id, "status",
                                 {"phase": observation["phase"], "reconciled": True})

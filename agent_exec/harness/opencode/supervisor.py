@@ -325,6 +325,9 @@ def main() -> int:
     parser.add_argument("--evidence-root", required=True)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--session-label", default="supervisor")
+    parser.add_argument("--profiles-dir", type=Path, default=None,
+                        help="profiles directory for admission-gated "
+                             "operations (default: agent_exec/profiles)")
     parser.add_argument("--operations", type=Path, default=None,
                         help="JSON file mapping operation ids to launch specs")
     args = parser.parse_args()
@@ -334,7 +337,8 @@ def main() -> int:
     controller = JobController(Path(args.store), evidence_root=Path(args.evidence_root),
                                session_id=args.session_label)
     token = secrets.token_hex(16)
-    supervisor = Supervisor(controller, operations, token=token)
+    supervisor = Supervisor(controller, operations, token=token,
+                            profiles_dir=args.profiles_dir)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(supervisor))
     port = server.server_port
     # The token is emitted once, locally, for the session driver to hand to

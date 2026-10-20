@@ -35,6 +35,7 @@ class LedgerEntry:
     job_id: str | None = None
     receipt: dict[str, Any] = field(default_factory=dict)
     input_fingerprint: str | None = None
+    observed_via: str = "caller"
     updated_wall: float = field(default_factory=time.time)
 
 
@@ -48,6 +49,15 @@ class VerificationLedger:
     observe_from_store() is the stronger binding: it fetches the CURRENT
     receipt through the controller itself, so no caller-supplied receipt
     body can ever certify an automated pass.
+
+    Provenance: every entry records ``observed_via`` — ``store``
+    (observe_from_store(): the controller itself fetched the receipt),
+    ``manual`` (a declared human acceptance), or ``caller`` (a
+    caller-supplied receipt body passed to observe()). An automated
+    ``passed`` with ``observed_via='caller'`` is valid only when the
+    receipt genuinely came from a controller; reviewers should treat
+    caller-bound automated passes as unverified provenance and prefer
+    re-observation through observe_from_store().
     """
 
     def __init__(self, requirements: list[Requirement]):
@@ -56,12 +66,19 @@ class VerificationLedger:
 
     def observe(self, *, requirement_id: str, job_id: str | None, outcome: str,
                 receipt: dict | None = None, input_fingerprint: str | None = None,
-                wall: float | None = None) -> LedgerEntry:
+                wall: float | None = None,
+                observed_via: str | None = None) -> LedgerEntry:
         if requirement_id not in self.requirements:
             raise KeyError(f"unknown requirement: {requirement_id!r}")
         if outcome not in STATES:
             raise ValueError(f"unknown outcome state: {outcome!r}")
         requirement = self.requirements[requirement_id]
+        if observed_via is None:
+            # Default provenance from the call shape: a manual requirement's
+            # declared acceptance vs. a caller-supplied automated receipt.
+            observed_via = "manual" if requirement.manual else "caller"
+        elif observed_via not in ("store", "caller", "manual"):
+            raise ValueError(f"unknown observed_via: {observed_via!r}")
         if outcome == "passed" and not requirement.manual:
             # An automated check passes only on the strength of a trusted job
             # receipt: a real job id plus recorded pass AND verified cleanup.
@@ -87,7 +104,7 @@ class VerificationLedger:
             requirement_id=requirement_id, operation_id=self.requirements[requirement_id].operation_id,
             scope=self.requirements[requirement_id].scope, state=outcome,
             job_id=job_id, receipt=receipt or {},
-            input_fingerprint=input_fingerprint,
+            input_fingerprint=input_fingerprint, observed_via=observed_via,
             updated_wall=wall if wall is not None else time.time())
         self.entries[requirement_id] = entry
         return entry
@@ -104,7 +121,9 @@ class VerificationLedger:
 
         Receipt -> state mapping (documented decision):
         - no terminal ``outcome`` field (running/unlaunched/unknown status
-          payload) -> ``running``;
+          payload) -> ``running``; these payloads carry no ``operation_id``,
+          so the operation-id check is skipped for them — identity is the
+          store-addressed job id alone;
         - ``outcome='passed'`` AND ``cleanup='verified_empty'`` ->
           ``passed`` (same standard as observe());
         - every other terminal outcome — ``failed``, ``timed_out``,
@@ -120,9 +139,11 @@ class VerificationLedger:
         ``RuntimeError`` subclass the controller raises) is re-raised as
         ``ValueError`` with the original exception chained, so callers can
         catch one type for store-access problems. A receipt whose
-        ``job_id`` or ``operation_id`` does not match the requested
-        job/requirement raises ``ValueError``. Any other controller error
-        propagates unchanged.
+        ``job_id`` does not match the requested job raises ``ValueError``
+        unconditionally; a mismatching ``operation_id`` raises
+        ``ValueError`` for TERMINAL receipts. Non-terminal status payloads
+        are exempt from the operation-id check (see the mapping below).
+        Any other controller error propagates unchanged.
         """
         if requirement_id not in self.requirements:
             raise KeyError(f"unknown requirement: {requirement_id!r}")
@@ -139,21 +160,28 @@ class VerificationLedger:
             raise ValueError(f"store receipt is for a different job "
                              f"({receipt.get('job_id')!r} != {job_id!r})")
         requirement = self.requirements[requirement_id]
-        if receipt.get("operation_id") != requirement.operation_id:
-            raise ValueError("store receipt belongs to a different "
-                             f"operation ({receipt.get('operation_id')!r} "
-                             f"!= {requirement.operation_id!r})")
         outcome = receipt.get("outcome")
         if outcome is None:
-            state = "running"  # status payload, not a terminal receipt
-        elif outcome == "passed" \
-                and receipt.get("cleanup") == "verified_empty":
-            state = "passed"
+            # Non-terminal status payload (running/unlaunched/unknown): the
+            # real JobController.status() emits only job_id/state/phase/unit
+            # — no operation_id — so identity here is the store-addressed
+            # job id, which was just verified. The operation-id check below
+            # applies only to terminal receipts, which always carry it.
+            state = "running"
         else:
-            state = "failed"
+            if receipt.get("operation_id") != requirement.operation_id:
+                raise ValueError("store receipt belongs to a different "
+                                 f"operation ({receipt.get('operation_id')!r} "
+                                 f"!= {requirement.operation_id!r})")
+            if outcome == "passed" \
+                    and receipt.get("cleanup") == "verified_empty":
+                state = "passed"
+            else:
+                state = "failed"
         return self.observe(requirement_id=requirement_id, job_id=job_id,
                             outcome=state, receipt=receipt,
-                            input_fingerprint=input_fingerprint)
+                            input_fingerprint=input_fingerprint,
+                            observed_via="store")
 
     def invalidate_stale(self, current_fingerprint: str | None) -> list[str]:
         """Mark passed receipts stale when the relevant inputs changed.
@@ -181,7 +209,9 @@ class VerificationLedger:
             if requirement.manual:
                 # Manual acceptance is declared, never self-certified here.
                 checks[requirement_id] = {"state": state, "manual": True,
-                                          "operation_id": requirement.operation_id}
+                                          "operation_id": requirement.operation_id,
+                                          "observed_via":
+                                          entry.observed_via if entry else None}
                 if state != "passed":
                     complete = False
                 continue
@@ -191,6 +221,7 @@ class VerificationLedger:
                 "job_id": entry.job_id if entry else None,
                 "receipt_outcome": (entry.receipt or {}).get("outcome")
                 if entry else None,
+                "observed_via": entry.observed_via if entry else None,
                 "input_fingerprint": entry.input_fingerprint if entry else None,
                 "updated_wall": entry.updated_wall if entry else None,
             }

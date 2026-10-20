@@ -32,6 +32,27 @@ PROMPT = ("Use the project_run tool exactly once to run operation 'aflow.web.uni
           "the receipt, and cleanup. Do not run any other tools and do not retry.")
 
 
+def build_operations(session_home: Path) -> dict:
+    """The driver's operation configuration in the supervisor-accepted shape.
+
+    The scored aflow.web.unit operation binds the admitted aflow-web-p100
+    profile and its owned source root; it carries NO argv and NO cwd (the
+    profile renders both at launch). HOME is pinned to the session home so
+    npm never writes outside the session.
+    """
+    return {
+        "aflow.web.unit": {
+            "profile_id": "aflow-web-p100",
+            "scored": True,
+            "source_root": SOURCE,
+            "deadline_seconds": 180,
+            "env": {"PATH": f"{NODE_BIN}:/usr/local/bin:/usr/bin:/bin",
+                    "npm_config_audit": "false", "npm_config_fund": "false",
+                    "NO_COLOR": "1", "HOME": str(session_home)},
+        },
+    }
+
+
 def wait_health(url: str, token: str, timeout: float = 20) -> None:
     deadline = time.monotonic() + timeout
     request = urllib.request.Request(url, headers={"X-Agent-Exec-Token": token})
@@ -56,26 +77,14 @@ def main() -> int:
     work = session / "work"
     for path in (config_dir, work, session / "home", session / "tmp"):
         path.mkdir(parents=True)
-    operations = {
-        "aflow.web.unit": {
-            "argv": [f"{NODE_BIN}/npm", "--prefix", "apps/aflow_app/web", "test",
-                     "--", "--run", "--maxWorkers=1", "--minWorkers=1",
-                     "--pool=forks", "--reporter=json",
-                     "--outputFile={report_dir}/vitest-json.json"],
-            "cwd": SOURCE,
-            "deadline_seconds": 180,
-            "profile_id": "aflow-web-p100",
-            "env": {"PATH": f"{NODE_BIN}:/usr/local/bin:/usr/bin:/bin",
-                    "npm_config_audit": "false", "npm_config_fund": "false",
-                    "NO_COLOR": "1"},
-        },
-    }
+    operations = build_operations(session / "home")
     (PROOF / "operations.json").write_text(json.dumps(operations, indent=2))
     supervisor = subprocess.Popen(
         [sys.executable, str(HERE / "supervisor.py"),
          "--store", str(PROOF / "supervisor-store.sqlite"),
          "--evidence-root", str(PROOF / "evidence"),
          "--session-label", "qfn-validation",
+         "--profiles-dir", str(MODULE / "profiles"),
          "--operations", str(PROOF / "operations.json")],
         stdout=subprocess.PIPE, text=True, start_new_session=True)
     line = supervisor.stdout.readline()
